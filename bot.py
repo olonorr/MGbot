@@ -32,7 +32,7 @@ def getData() -> str:
 
 @bot.message_handler(commands=['start'])
 def main(message):
-    bot.send_message(message.chat.id, "getData()")
+    bot.send_message(message.chat.id, getData())
 
 
 bot.polling(non_stop=True)
