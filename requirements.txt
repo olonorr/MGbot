@@ -1,1 +1,4 @@
 websockets
+telebot
+json
+asyncio
