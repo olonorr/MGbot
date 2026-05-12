@@ -6,7 +6,7 @@ apihelper.proxy = {'https': 'http://127.0.0.1:1443'}
 
 
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(API_TOKEN)
 
 
 @bot.message_handler(commands=['start'])
