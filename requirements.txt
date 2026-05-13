@@ -1,5 +1,5 @@
 websockets==13.1
 telebot
 asyncio
-python-telegram-bot==20.7
+python-telegram-bot
 telegram
