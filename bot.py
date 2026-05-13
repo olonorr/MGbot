@@ -154,6 +154,7 @@ async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
         
         try:
             async with websockets.connect(uri, close_timeout=3) as websocket:
+                print(f"Подключено с версией {version}")
                 logger.info(f"Подключено с версией {version}")
                 
                 while True:
@@ -165,15 +166,19 @@ async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
                         await notifier.check_for_updates(context, json_data)
                         
                     except asyncio.TimeoutError:
+                        print("Ожидание данных...")
                         logger.info("Ожидание данных...")
                         continue
                     except websockets.exceptions.ConnectionClosed:
+                        print("Соединение закрыто, переподключение...")
                         logger.warning("Соединение закрыто, переподключение...")
                         break
                     except Exception as e:
+                        print(f"Ошибка обработки: {e}")
                         logger.error(f"Ошибка обработки: {e}")
                         
         except Exception as e:
+            print(f"Ошибка с версией {version}: {e}")
             logger.error(f"Ошибка с версией {version}: {e}")
             continue
 
