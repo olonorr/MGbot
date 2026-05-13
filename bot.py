@@ -278,27 +278,8 @@ async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_weather = shop_tracker.get_weather(shop_tracker.global_json_data)
     
     if current_weather:
-        weather_emoji = {
-            'Sunny': '☀️',
-            'Rainy': '🌧️',
-            'Stormy': '⛈️',
-            'Snowy': '❄️',
-            'Cloudy': '☁️',
-            'Foggy': '🌫️'
-        }
-        emoji = weather_emoji.get(current_weather, '🌡️')
         
-        weather_tips = {
-            'Sunny': '☀️ Отличная погода для роста растений!',
-            'Rainy': '🌧️ Дождь поливает растения естественным путем.',
-            'Stormy': '⛈️ Будьте осторожны, шторм может повредить урожай!',
-            'Snowy': '❄️ Снег замедляет рост растений.',
-            'Cloudy': '☁️ Пасмурно, но растениям комфортно.',
-            'Foggy': '🌫️ Туман создает загадочную атмосферу.'
-        }
-        tip = weather_tips.get(current_weather, '')
-        
-        message = f"**Текущая погода:** {emoji} {current_weather}\n\n{tip}"
+        message = f"**Текущая погода:** Необычная"
         
         keyboard = [[
             InlineKeyboardButton("🔔 Подписаться на погоду", callback_data="sub_weather")
@@ -307,7 +288,7 @@ async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
     else:
-        await update.message.reply_text("Информация о погоде недоступна.")
+        await update.message.reply_text("Сейчас небо чистое")
 
 async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать текущие товары в магазине"""
@@ -364,11 +345,8 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 
                 if available:
                     message += "\n".join(available) + "\n"
-                if unavailable and len(unavailable) <= 10:
-                    if unavailable:
-                        message += "\n".join(unavailable[:5]) + "\n"
-                if len(unavailable) > 10:
-                    message += f"  ... и {len(unavailable) - 5} других\n"
+                if unavailable:
+                    message += "\n".join(unavailable) + "\n"
     else:
         shop_names = {
             'seed': '🌱 Семена',
@@ -401,9 +379,7 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
             message += "❌ Нет товаров в наличии\n\n"
         
         if unavailable:
-            message += "**Нет в наличии:**\n" + "\n".join(unavailable[:20])
-            if len(unavailable) > 20:
-                message += f"\n... и {len(unavailable) - 20} других"
+            message += "**Нет в наличии:**\n" + "\n".join(unavailable)
         
         # Добавляем кнопки для подписки на категорию или конкретные товары
         keyboard = [
@@ -511,7 +487,7 @@ async def show_category_items(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = []
     # Показываем все товары с возможностью подписки на каждый
-    for item in sorted(inventory.keys())[:30]:  # Ограничиваем 30 товарами
+    for item in sorted(inventory.keys())[:]:  # Ограничиваем 30 товарами
         keyboard.append([
             InlineKeyboardButton(
                 f"🔔 {item}",
@@ -755,24 +731,15 @@ async def weather_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_weather = shop_tracker.get_weather(shop_tracker.global_json_data)
     
     if current_weather:
-        weather_emoji = {
-            'Sunny': '☀️',
-            'Rainy': '🌧️',
-            'Stormy': '⛈️',
-            'Snowy': '❄️',
-            'Cloudy': '☁️',
-            'Foggy': '🌫️'
-        }
-        emoji = weather_emoji.get(current_weather, '🌡️')
         
-        message = f"**Текущая погода:** {emoji} {current_weather}"
+        message = f"**Текущая погода:** Необычная"
         
         keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_start")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(message, parse_mode='Markdown', reply_markup=reply_markup)
     else:
-        await query.edit_message_text("Информация о погоде недоступна.")
+        await query.edit_message_text("Сейчас небо чистое")
 
 def get_category_icon(category: str) -> str:
     """Получить иконку категории"""
@@ -830,15 +797,10 @@ if __name__ == "__main__":
         while True:
             new_data = asyncio.run(get_data())
             update_game_data(new_data)
-            # Здесь должна быть ваша логика получения данных
-            # Например, из WebSocket, API или другого источника
-            time.sleep(5)  # Проверка каждые 10 секунд
-            # new_data = get_data_from_source()
-            # shop_tracker.update_data(new_data)
+            time.sleep(5)
     
     # Запускаем поток обновления данных
     updater_thread = threading.Thread(target=data_updater, daemon=True)
     updater_thread.start()
-    
     
     main()
