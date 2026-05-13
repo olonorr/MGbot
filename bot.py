@@ -1,501 +1,261 @@
 import asyncio
 import websockets
 import json
-import logging
-from datetime import datetime
-from typing import Dict, Set, List, Optional
-from dataclasses import dataclass
-from enum import Enum
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
-from telegram.error import TelegramError
+# Токен вашего бота (замените на свой)
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# Параметры подключения к WebSocket
+ROOM_ID = "7TWG"
+PLAYER_ID = "p_KWTb7ix7rFYy9yhS"
 
-# Конфигурация
-TELEGRAM_TOKEN = "8538742738:AAF2QqkbRkMueE1fOg-n7Yb1EFRRnXOjPV4"  # Замените на ваш токен
-ROOM_CODE = "7TWG"
-PLAYER_ID = "p_KWTb7ix7rFYy9yhS"  # Ваш ID игрока
+# Глобальная переменная для хранения рабочей версии
+current_version = None
 
-# Хранилище подписок
-class SubscriptionType(Enum):
-    SEED = "seed"
-    TOOL = "tool"
-    EGG = "egg"
-    DECOR = "decor"
-    WEATHER = "weather"
-
-@dataclass
-class Subscription:
-    user_id: int
-    shop_type: SubscriptionType
-    item_id: Optional[str] = None  # Для товаров - ID, для погоды None
-    item_name: Optional[str] = None
-
-class ShopNotifier:
-    def __init__(self):
-        self.subscriptions: Dict[int, Set[Subscription]] = {}  # user_id -> set of subscriptions
-        self.last_shop_state: Dict[str, Dict] = {}  # shop_type -> {item_id: stock}
-        self.last_weather = None
-        
-    def add_subscription(self, user_id: int, shop_type: SubscriptionType, item_id: str = None, item_name: str = None):
-        if user_id not in self.subscriptions:
-            self.subscriptions[user_id] = set()
-        self.subscriptions[user_id].add(Subscription(user_id, shop_type, item_id, item_name))
-        logger.info(f"Пользователь {user_id} подписался на {shop_type.value}: {item_id or 'все'}")
-        
-    def remove_subscription(self, user_id: int, shop_type: SubscriptionType, item_id: str = None):
-        if user_id in self.subscriptions:
-            to_remove = [s for s in self.subscriptions[user_id] 
-                        if s.shop_type == shop_type and (item_id is None or s.item_id == item_id)]
-            for sub in to_remove:
-                self.subscriptions[user_id].discard(sub)
-                logger.info(f"Пользователь {user_id} отписался от {shop_type.value}: {item_id or 'все'}")
-                
-    def get_user_subscriptions(self, user_id: int) -> List[Subscription]:
-        return list(self.subscriptions.get(user_id, set()))
-    
-    async def check_for_updates(self, context: ContextTypes.DEFAULT_TYPE, game_data: dict):
-        """Проверяет обновления в магазинах и погоде"""
-        if not game_data or 'child' not in game_data or 'data' not in game_data['child']:
-            return
-            
-        shops_data = game_data['child']['data'].get('shops', {})
-        weather = game_data['child']['data'].get('weather')
-        
-        # Проверка погоды
-        if weather != self.last_weather:
-            if weather is not None:
-                await self.notify_weather_change(context, weather)
-            self.last_weather = weather
-            
-        # Проверка магазинов
-        for shop_type in [SubscriptionType.SEED, SubscriptionType.TOOL, 
-                         SubscriptionType.EGG, SubscriptionType.DECOR]:
-            if shop_type.value in shops_data:
-                await self.check_shop_updates(context, shop_type, shops_data[shop_type.value])
-    
-    async def check_shop_updates(self, context: ContextTypes.DEFAULT_TYPE, 
-                                 shop_type: SubscriptionType, shop_data: dict):
-        """Проверяет обновления в конкретном магазине"""
-        current_state = {}
-        notifications = []
-        
-        for item in shop_data.get('inventory', []):
-            item_id = item.get('species') or item.get('toolId') or item.get('eggId') or item.get('decorId')
-            stock = item.get('initialStock', 0)
-            if item_id:
-                current_state[item_id] = stock
-                
-                # Проверяем, был ли товар в наличии раньше
-                old_state = self.last_shop_state.get(f"{shop_type.value}_{item_id}", 0)
-                if old_state == 0 and stock > 0:
-                    # Товар появился в наличии
-                    notifications.append((shop_type, item_id, stock))
-                
-        self.last_shop_state.update({f"{shop_type.value}_{k}": v for k, v in current_state.items()})
-        
-        # Отправляем уведомления
-        for shop_type_notif, item_id, stock in notifications:
-            await self.notify_item_available(context, shop_type_notif, item_id, stock)
-    
-    async def notify_item_available(self, context: ContextTypes.DEFAULT_TYPE, 
-                                    shop_type: SubscriptionType, item_id: str, stock: int):
-        """Уведомляет пользователей о появлении товара"""
-        shop_names = {
-            SubscriptionType.SEED: "🌱 Семена",
-            SubscriptionType.TOOL: "🔧 Инструменты",
-            SubscriptionType.EGG: "🥚 Яйца",
-            SubscriptionType.DECOR: "🎨 Декор"
-        }
-        
-        # Форматируем название товара
-        item_display = item_id.replace('_', ' ').strip()
-        
-        message = (
-            f"✨ {shop_names[shop_type]} ✨\n\n"
-            f"Товар появился в наличии!\n"
-            f"📦 {item_display}\n"
-            f"📊 В наличии: {stock} шт.\n\n"
-            f"🔗 Ссылка: magicgarden.gg"
-        )
-        
-        notified_users = set()
-        for user_id, subs in self.subscriptions.items():
-            for sub in subs:
-                if sub.shop_type == shop_type and (sub.item_id is None or sub.item_id == item_id):
-                    if user_id not in notified_users:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=message,
-                                parse_mode='HTML'
-                            )
-                            notified_users.add(user_id)
-                            logger.info(f"Уведомление отправлено пользователю {user_id} о товаре {item_id}")
-                        except TelegramError as e:
-                            logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
-    
-    async def notify_weather_change(self, context: ContextTypes.DEFAULT_TYPE, weather_data):
-        """Уведомляет о смене погоды"""
-        weather_text = self.format_weather(weather_data)
-        message = f"🌤️ <b>Погода изменилась!</b> 🌤️\n\n{weather_text}"
-        
-        notified_users = set()
-        for user_id, subs in self.subscriptions.items():
-            for sub in subs:
-                if sub.shop_type == SubscriptionType.WEATHER:
-                    if user_id not in notified_users:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=message,
-                                parse_mode='HTML'
-                            )
-                            notified_users.add(user_id)
-                            logger.info(f"Уведомление о погоде отправлено пользователю {user_id}")
-                        except TelegramError as e:
-                            logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
-    
-    def format_weather(self, weather_data):
-        """Форматирует данные о погоде для отображения"""
-        if isinstance(weather_data, dict):
-            lines = []
-            for key, value in weather_data.items():
-                lines.append(f"• {key}: {value}")
-            return "\n".join(lines)
-        return str(weather_data)
-
-# Глобальный экземпляр уведомителя
-notifier = ShopNotifier()
-websocket_connection = None
-latest_game_data = None
-
-async def websocket_listener():
-    """Постоянный WebSocket слушатель"""
-    global latest_game_data, websocket_connection
-    
-    versions_to_try = ["312", "313", "314", "315", "316", "317"]
+async def find_working_version():
+    """Бесконечный перебор версий начиная с 310 до нахождения рабочей"""
+    version = 310
     
     while True:
-        for version in versions_to_try:
-            uri = f"wss://magicgarden.gg/version/{version}/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22{version}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
-            
-            try:
-                async with websockets.connect(uri, close_timeout=5, ping_interval=20, ping_timeout=60) as websocket:
-                    logger.info(f"✅ WebSocket подключен с версией {version}")
-                    print(f"✅ WebSocket подключен с версией {version}")
-                    websocket_connection = websocket
-                    
-                    while True:
-                        try:
-                            data = await asyncio.wait_for(websocket.recv(), timeout=30)
-                            json_data = json.loads(data)
-                            latest_game_data = json_data
-                            
-                            # Логируем полученные типы данных (для отладки)
-                            if 'type' in json_data:
-                                logger.debug(f"Получен тип данных: {json_data['type']}")
-                            
-                        except asyncio.TimeoutError:
-                            # Нормальное поведение - просто ждем дальше
-                            continue
-                        except websockets.exceptions.ConnectionClosed:
-                            logger.warning("WebSocket соединение закрыто")
-                            break
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Ошибка парсинга JSON: {e}")
-                            continue
-                        except Exception as e:
-                            logger.error(f"Ошибка обработки WebSocket данных: {e}")
-                            continue
-                            
-            except Exception as e:
-                logger.error(f"Ошибка подключения с версией {version}: {e}")
-                continue
+        version_str = str(version)
+        uri = f"wss://magicgarden.gg/version/{version_str}/api/rooms/{ROOM_ID}/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22{PLAYER_ID}%22&version=%22{version_str}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
         
-        # Если все версии не сработали, ждем перед повторной попыткой
-        logger.warning("Все версии WebSocket не сработали, переподключение через 30 секунд...")
-        await asyncio.sleep(30)
-
-async def game_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job для проверки обновлений"""
-    global latest_game_data
-    
-    if latest_game_data:
         try:
-            await notifier.check_for_updates(context, latest_game_data)
-        except Exception as e:
-            logger.error(f"Ошибка при проверке обновлений: {e}")
-    else:
-        logger.debug("Ожидание данных от WebSocket...")
-
-# Команды бота
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветственное сообщение"""
-    welcome_text = """
-🌿 <b>Magic Garden Shop Monitor Bot</b> 🌿
-
-Я слежу за магазинами и погодой в игре Magic Garden!
-
-<b>Доступные команды:</b>
-/subscribe_seed - Подписаться на семена
-/subscribe_tool - Подписаться на инструменты  
-/subscribe_egg - Подписаться на яйца
-/subscribe_decor - Подписаться на декор
-/subscribe_weather - Подписаться на погоду
-
-/unsubscribe - Отписаться от категории
-/my_subscriptions - Мои подписки
-
-При появлении товара или смене погоды я пришлю уведомление!
-"""
-    try:
-        await update.message.reply_text(welcome_text, parse_mode='HTML')
-    except TelegramError as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
-
-async def show_shop_items(update: Update, context: ContextTypes.DEFAULT_TYPE, shop_type: SubscriptionType, shop_name: str):
-    """Показывает доступные товары в магазине для подписки"""
-    items = {
-        SubscriptionType.SEED: ["Carrot", "Cabbage", "Strawberry", "Aloe", "Beet", "Tomato", "Pumpkin"],
-        SubscriptionType.TOOL: ["WateringCan", "PlanterPot", "CropCleanser", "Shovel"],
-        SubscriptionType.EGG: ["CommonEgg", "UncommonEgg", "RareEgg"],
-        SubscriptionType.DECOR: ["SmallRock", "MediumRock", "WoodBench", "StoneBench"]
-    }
-    
-    keyboard = []
-    for item in items.get(shop_type, []):
-        keyboard.append([InlineKeyboardButton(item, callback_data=f"sub_{shop_type.value}_{item}")])
-    keyboard.append([InlineKeyboardButton("🔔 Подписаться на все", callback_data=f"sub_{shop_type.value}_all")])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"Выберите товар в категории <b>{shop_name}</b>:", 
-                                   parse_mode='HTML', reply_markup=reply_markup)
-
-async def subscribe_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_shop_items(update, context, SubscriptionType.SEED, "Семена")
-
-async def subscribe_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_shop_items(update, context, SubscriptionType.TOOL, "Инструменты")
-
-async def subscribe_egg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_shop_items(update, context, SubscriptionType.EGG, "Яйца")
-
-async def subscribe_decor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_shop_items(update, context, SubscriptionType.DECOR, "Декор")
-
-async def subscribe_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подписка на погоду"""
-    user_id = update.effective_user.id
-    notifier.add_subscription(user_id, SubscriptionType.WEATHER)
-    await update.message.reply_text("🌤️ Вы подписались на уведомления о погоде!")
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка callback кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    data = query.data
-    
-    try:
-        if data == "back_to_menu":
-            await query.edit_message_text(
-                "Выберите действие:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🌱 Семена", callback_data="menu_seed")],
-                    [InlineKeyboardButton("🔧 Инструменты", callback_data="menu_tool")],
-                    [InlineKeyboardButton("🥚 Яйца", callback_data="menu_egg")],
-                    [InlineKeyboardButton("🎨 Декор", callback_data="menu_decor")],
-                    [InlineKeyboardButton("🌤️ Погода", callback_data="menu_weather")],
-                    [InlineKeyboardButton("📋 Мои подписки", callback_data="menu_my_subs")]
-                ])
-            )
-        elif data.startswith("sub_"):
-            parts = data.split("_")
-            shop_type_str = parts[1]
-            item_id = "_".join(parts[2:]) if len(parts) > 2 else None
-            
-            shop_type = {
-                "seed": SubscriptionType.SEED,
-                "tool": SubscriptionType.TOOL,
-                "egg": SubscriptionType.EGG,
-                "decor": SubscriptionType.DECOR
-            }.get(shop_type_str)
-            
-            if shop_type:
-                if item_id == "all":
-                    notifier.add_subscription(user_id, shop_type)
-                    await query.edit_message_text(f"✅ Вы подписались на все товары в категории {shop_type_str}!")
-                else:
-                    notifier.add_subscription(user_id, shop_type, item_id)
-                    await query.edit_message_text(f"✅ Вы подписались на товар {item_id}!")
-        
-        elif data.startswith("menu_"):
-            action = data[5:]
-            if action == "seed":
-                await show_shop_items_from_callback(query, SubscriptionType.SEED, "Семена")
-            elif action == "tool":
-                await show_shop_items_from_callback(query, SubscriptionType.TOOL, "Инструменты")
-            elif action == "egg":
-                await show_shop_items_from_callback(query, SubscriptionType.EGG, "Яйца")
-            elif action == "decor":
-                await show_shop_items_from_callback(query, SubscriptionType.DECOR, "Декор")
-            elif action == "weather":
-                notifier.add_subscription(user_id, SubscriptionType.WEATHER)
-                await query.edit_message_text("🌤️ Вы подписались на уведомления о погоде!")
-            elif action == "my_subs":
-                await show_user_subscriptions(query, user_id)
-        elif data.startswith("unsub_"):
-            parts = data.split("_")
-            shop_type_str = parts[1]
-            item_id = parts[2] if len(parts) > 2 and parts[2] != 'all' else None
-            
-            shop_type = {
-                "seed": SubscriptionType.SEED,
-                "tool": SubscriptionType.TOOL,
-                "egg": SubscriptionType.EGG,
-                "decor": SubscriptionType.DECOR,
-                "weather": SubscriptionType.WEATHER
-            }.get(shop_type_str)
-            
-            if shop_type:
-                notifier.remove_subscription(user_id, shop_type, item_id)
-                await query.edit_message_text(f"✅ Вы отписались от {shop_type_str}")
+            async with websockets.connect(uri, close_timeout=3) as websocket:
+                print(f"🔄 Пробуем версию {version_str}...")
+                data = await asyncio.wait_for(websocket.recv(), timeout=5)
+                json_data = json.loads(data)
                 
+                # Проверяем, что данные содержат информацию о магазинах
+                if json_data and "child" in json_data and "data" in json_data["child"]:
+                    print(f"✅ Найдена рабочая версия: {version_str}")
+                    return version_str
+                else:
+                    print(f"⚠️ Версия {version_str} не содержит данных магазина")
+                    
+        except websockets.exceptions.ConnectionClosedError as e:
+            print(f"❌ Версия {version_str} не подходит: {e}")
+        except asyncio.TimeoutError:
+            print(f"⏰ Таймаут для версии {version_str}")
+        except Exception as e:
+            print(f"❌ Ошибка для версии {version_str}: {e}")
+        
+        version += 1
+        
+        # Небольшая задержка между попытками, чтобы не перегружать сервер
+        await asyncio.sleep(0.5)
+
+async def get_shop_data():
+    """Получение данных магазина через WebSocket с использованием рабочей версии"""
+    global current_version
+    
+    # Если версия еще не найдена, ищем её
+    if current_version is None:
+        print("🔍 Поиск рабочей версии...")
+        current_version = await find_working_version()
+        if current_version is None:
+            print("❌ Не удалось найти рабочую версию")
+            return None
+    
+    uri = f"wss://magicgarden.gg/version/{current_version}/api/rooms/{ROOM_ID}/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22{PLAYER_ID}%22&version=%22{current_version}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
+    
+    try:
+        async with websockets.connect(uri, close_timeout=3) as websocket:
+            print(f"📡 Использую версию {current_version}...")
+            data = await asyncio.wait_for(websocket.recv(), timeout=5)
+            return json.loads(data)
     except Exception as e:
-        logger.error(f"Ошибка в handle_callback: {e}", exc_info=True)
-        await query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
+        print(f"❌ Ошибка при получении данных с версией {current_version}: {e}")
+        # Если текущая версия перестала работать, сбрасываем её и ищем новую
+        print("🔄 Текущая версия перестала работать, ищем новую...")
+        current_version = None
+        return await get_shop_data()  # Рекурсивно пробуем найти новую версию
 
-async def show_shop_items_from_callback(query, shop_type: SubscriptionType, shop_name: str):
-    """Показывает товары из callback"""
-    items = {
-        SubscriptionType.SEED: ["Carrot", "Cabbage", "Strawberry", "Aloe", "Beet", "Tomato", "Pumpkin"],
-        SubscriptionType.TOOL: ["WateringCan", "PlanterPot", "CropCleanser", "Shovel"],
-        SubscriptionType.EGG: ["CommonEgg", "UncommonEgg", "RareEgg"],
-        SubscriptionType.DECOR: ["SmallRock", "MediumRock", "WoodBench", "StoneBench"]
-    }
+def format_shop_info(data):
+    """Форматирование информации о магазине для вывода в Telegram"""
+    if not data:
+        return "❌ Не удалось получить данные магазина"
     
-    keyboard = []
-    for item in items.get(shop_type, []):
-        keyboard.append([InlineKeyboardButton(item, callback_data=f"sub_{shop_type.value}_{item}")])
-    keyboard.append([InlineKeyboardButton("🔔 Подписаться на все", callback_data=f"sub_{shop_type.value}_all")])
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(f"Выберите товар в категории <b>{shop_name}</b>:", 
-                                 parse_mode='HTML', reply_markup=reply_markup)
-
-async def show_user_subscriptions(query, user_id: int):
-    """Показывает текущие подписки пользователя"""
-    subs = notifier.get_user_subscriptions(user_id)
-    
-    if not subs:
-        text = "У вас нет активных подписок."
-    else:
-        text = "📋 <b>Ваши подписки:</b>\n\n"
-        for sub in subs:
-            if sub.shop_type == SubscriptionType.WEATHER:
-                text += "🌤️ Погода\n"
-            else:
-                item_display = sub.item_id if sub.item_id else "все товары"
-                text += f"• {sub.shop_type.value}: {item_display}\n"
-        text += "\nДля отписки используйте /unsubscribe"
-    
-    await query.edit_message_text(text, parse_mode='HTML')
-
-async def unsubscribe_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню отписки"""
-    user_id = update.effective_user.id
-    subs = notifier.get_user_subscriptions(user_id)
-    
-    if not subs:
-        await update.message.reply_text("У вас нет активных подписок.")
-        return
-    
-    keyboard = []
-    for sub in subs:
-        if sub.shop_type == SubscriptionType.WEATHER:
-            name = "🌤️ Погода"
-            callback = f"unsub_weather_all"
+    try:
+        # Извлекаем данные магазинов
+        shops = data.get("child", {}).get("data", {}).get("shops", {})
+        
+        result = f"🏪 **Информация о магазинах Magic Garden** 🏪\n"
+        if current_version:
+            result += f"📌 Версия протокола: {current_version}\n\n"
         else:
-            name = f"{sub.shop_type.value}: {sub.item_id if sub.item_id else 'все'}"
-            callback = f"unsub_{sub.shop_type.value}_{sub.item_id if sub.item_id else 'all'}"
-        keyboard.append([InlineKeyboardButton(name, callback_data=callback)])
-    
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите подписку для отмены:", reply_markup=reply_markup)
+            result += "\n"
+        
+        # Магазин семян
+        seed_shop = shops.get("seed", {})
+        result += f"🌱 **Магазин семян**\n"
+        result += f"⏰ Перезагрузка через: {seed_shop.get('secondsUntilRestock', 0)} сек.\n"
+        
+        seed_inventory = seed_shop.get("inventory", [])
+        available_seeds = [item for item in seed_inventory if item.get("initialStock", 0) > 0]
+        
+        if available_seeds:
+            result += "📦 В наличии:\n"
+            for seed in available_seeds[:10]:  # Показываем первые 10
+                species = seed.get("species", "Unknown")
+                stock = seed.get("initialStock", 0)
+                result += f"  • {species}: {stock} шт.\n"
+            if len(available_seeds) > 10:
+                result += f"  ... и еще {len(available_seeds) - 10} видов\n"
+        else:
+            result += "  ❌ Нет семян в наличии\n"
+        
+        result += "\n"
+        
+        # Магазин инструментов
+        tool_shop = shops.get("tool", {})
+        result += f"🔧 **Магазин инструментов**\n"
+        result += f"⏰ Перезагрузка через: {tool_shop.get('secondsUntilRestock', 0)} сек.\n"
+        
+        tool_inventory = tool_shop.get("inventory", [])
+        available_tools = [item for item in tool_inventory if item.get("initialStock", 0) > 0]
+        
+        if available_tools:
+            result += "📦 В наличии:\n"
+            for tool in available_tools:
+                tool_id = tool.get("toolId", tool.get("decorId", "Unknown"))
+                stock = tool.get("initialStock", 0)
+                item_type = tool.get("itemType", "Tool")
+                result += f"  • {tool_id} ({item_type}): {stock} шт.\n"
+        else:
+            result += "  ❌ Нет инструментов в наличии\n"
+        
+        result += "\n"
+        
+        # Магазин яиц
+        egg_shop = shops.get("egg", {})
+        result += f"🥚 **Магазин яиц**\n"
+        result += f"⏰ Перезагрузка через: {egg_shop.get('secondsUntilRestock', 0)} сек.\n"
+        
+        egg_inventory = egg_shop.get("inventory", [])
+        available_eggs = [item for item in egg_inventory if item.get("initialStock", 0) > 0]
+        
+        if available_eggs:
+            result += "📦 В наличии:\n"
+            for egg in available_eggs:
+                egg_id = egg.get("eggId", "Unknown")
+                stock = egg.get("initialStock", 0)
+                result += f"  • {egg_id}: {stock} шт.\n"
+        else:
+            result += "  ❌ Нет яиц в наличии\n"
+        
+        result += "\n"
+        
+        # Магазин декора
+        decor_shop = shops.get("decor", {})
+        result += f"🎨 **Магазин декора**\n"
+        result += f"⏰ Перезагрузка через: {decor_shop.get('secondsUntilRestock', 0)} сек.\n"
+        
+        decor_inventory = decor_shop.get("inventory", [])
+        available_decor = [item for item in decor_inventory if item.get("initialStock", 0) > 0]
+        
+        if available_decor:
+            result += "📦 В наличии:\n"
+            for decor in available_decor[:10]:  # Показываем первые 10
+                decor_id = decor.get("decorId", "Unknown")
+                stock = decor.get("initialStock", 0)
+                result += f"  • {decor_id}: {stock} шт.\n"
+            if len(available_decor) > 10:
+                result += f"  ... и еще {len(available_decor) - 10} предметов\n"
+        else:
+            result += "  ❌ Нет декора в наличии\n"
+        
+        # Добавляем информацию о комнате
+        room_data = data.get("data", {})
+        result += f"\n📊 **Статус комнаты**\n"
+        result += f"🎮 Игра: {room_data.get('selectedGame', 'Unknown')}\n"
+        
+        timer = room_data.get("timer", {})
+        if timer.get("isRunning", False):
+            result += f"⏲️ Таймер: {timer.get('secondsRemaining', 0)} сек.\n"
+        
+        players = room_data.get("players", [])
+        result += f"👥 Игроков: {len(players)}\n"
+        
+        return result
+        
+    except Exception as e:
+        return f"❌ Ошибка при форматировании данных: {e}"
 
-async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает подписки пользователя"""
-    user_id = update.effective_user.id
-    subs = notifier.get_user_subscriptions(user_id)
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    await update.message.reply_text("🔄 Получаю информацию о магазинах Magic Garden...\n🔍 Поиск актуальной версии протокола...")
     
-    if not subs:
-        text = "У вас нет активных подписок."
+    # Получаем данные
+    data = await get_shop_data()
+    
+    if data:
+        # Форматируем и отправляем информацию
+        shop_info = format_shop_info(data)
+        await update.message.reply_text(shop_info, parse_mode='Markdown')
     else:
-        text = "📋 <b>Ваши подписки:</b>\n\n"
-        for sub in subs:
-            if sub.shop_type == SubscriptionType.WEATHER:
-                text += "🌤️ Погода\n"
-            else:
-                item_display = sub.item_id if sub.item_id else "все товары"
-                text += f"• {sub.shop_type.value}: {item_display}\n"
-    
-    await update.message.reply_text(text, parse_mode='HTML')
+        await update.message.reply_text("❌ Не удалось получить данные. Попробуйте позже.")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}", exc_info=True)
-    
-    if update and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "Произошла ошибка. Пожалуйста, попробуйте позже."
-            )
-        except:
-            pass
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = """
+🤖 **Помощь по боту Magic Garden**
+
+Доступные команды:
+/start - Показать актуальную информацию о магазинах
+/help - Показать это сообщение
+/shop - Показать информацию о магазинах (алиас /start)
+/version - Показать текущую используемую версию протокола
+/reset - Сбросить версию и найти новую
+
+📊 Бот показывает:
+• Ассортимент и количество товаров в каждом магазине
+• Время до следующей перезагрузки магазинов
+• Статус комнаты и количество игроков
+• Используемую версию протокола
+
+🔄 Особенности:
+• Бот автоматически ищет рабочую версию начиная с 310
+• При сбое текущей версии автоматически ищет новую
+• Версия сохраняется между запросами для быстрой работы
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Алиас для команды /start"""
+    await start_command(update, context)
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать текущую используемую версию"""
+    global current_version
+    if current_version:
+        await update.message.reply_text(f"📌 Текущая используемая версия протокола: **{current_version}**", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("🔍 Версия еще не определена. Используйте /start для поиска рабочей версии.")
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбросить версию и найти новую"""
+    global current_version
+    current_version = None
+    await update.message.reply_text("🔄 Версия сброшена. При следующем запросе будет выполнен поиск новой версии.\nИспользуйте /start для обновления информации.")
 
 def main():
     """Запуск бота"""
-    # Создание приложения
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    # Добавление обработчика ошибок
-    application.add_error_handler(error_handler)
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("shop", shop_command))
+    application.add_handler(CommandHandler("version", version_command))
+    application.add_handler(CommandHandler("reset", reset_command))
     
-    # Добавление обработчиков команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("subscribe_seed", subscribe_seed))
-    application.add_handler(CommandHandler("subscribe_tool", subscribe_tool))
-    application.add_handler(CommandHandler("subscribe_egg", subscribe_egg))
-    application.add_handler(CommandHandler("subscribe_decor", subscribe_decor))
-    application.add_handler(CommandHandler("subscribe_weather", subscribe_weather))
-    application.add_handler(CommandHandler("unsubscribe", unsubscribe_menu))
-    application.add_handler(CommandHandler("my_subscriptions", my_subscriptions))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Запускаем WebSocket слушатель в отдельном потоке
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(websocket_listener())
-    
-    # Добавление задачи мониторинга (каждые 5 секунд)
-    job_queue = application.job_queue
-    job_queue.run_repeating(game_monitor_job, interval=5, first=1)
-    
-    # Запуск бота
+    # Запускаем бота
     print("🤖 Бот запущен...")
-    print("📡 Подключение к WebSocket...")
+    print("🔍 Бот будет автоматически искать рабочие версии протокола начиная с 310")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
