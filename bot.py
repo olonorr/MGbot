@@ -518,16 +518,13 @@ def list_items(message):
         
         if available:
             message_text += f"✅ **В наличии ({len(available)}):**\n"
-            message_text += "• " + "\n• ".join(sorted(available)[:20])
-            if len(available) > 20:
-                message_text += f"\n... и {len(available) - 20} других"
+            message_text += "• " + "\n• ".join(sorted(available)[:])
             message_text += "\n\n"
         
         if unavailable:
             message_text += f"❌ **Отсутствуют ({len(unavailable)}):**\n"
-            message_text += "• " + "\n• ".join(sorted(unavailable)[:10])
-            if len(unavailable) > 10:
-                message_text += f"\n... и {len(unavailable) - 10} других"
+            message_text += "• " + "\n• ".join(sorted(unavailable)[:])
+
         
         message_text += "\n\n💡 **Подписки:**\n"
         message_text += "• `/subscribe Название` - на товар\n"
