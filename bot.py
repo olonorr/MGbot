@@ -795,8 +795,7 @@ if __name__ == "__main__":
         import time
         
         while True:
-            new_data = asyncio.run(get_data())
-            update_game_data(new_data)
+            update_game_data(asyncio.run(get_data()))
             time.sleep(5)
     
     # Запускаем поток обновления данных
