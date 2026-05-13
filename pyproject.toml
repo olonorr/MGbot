@@ -3,7 +3,7 @@ name = "MG"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "websockets",
+    "websockets==13.1",
     "telebot",
     "asyncio",
 ]
