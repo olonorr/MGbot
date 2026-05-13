@@ -6,30 +6,30 @@ import threading
 import time
 from datetime import datetime
 from collections import defaultdict
+import ssl
 
 bot = telebot.TeleBot("8538742738:AAF2QqkbRkMueE1fOg-n7Yb1EFRRnXOjPV4")
 uri = "wss://magicgarden.gg/version/311/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22311%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
 
-# Глобальные данные для всех пользователей
+# Глобальные данные
 current_global_stock = {}
 current_global_weather = None
 last_update_time = None
+websocket_connected = False
 
-# Подписки пользователей: {chat_id: {'items': set(), 'weather': bool}}
+# Подписки пользователей
 subscriptions = defaultdict(lambda: {'items': set(), 'weather': False})
 
-# Флаг для WebSocket потока
-websocket_running = True
-websocket_lock = threading.Lock()
-
-# Кэш для быстрых ответов (обновляется каждые 5 секунд)
+# Кэш данных
 data_cache = {
     'stock': {},
     'weather': None,
     'timestamp': 0
 }
 
-# Словарь для перевода названий погоды
+# Lock для потокобезопасности
+data_lock = threading.Lock()
+
 weather_translations = {
     "Clear": "☀️ Ясно",
     "Sunny": "☀️ Солнечно",
@@ -51,9 +51,8 @@ weather_translations = {
 
 def translate_weather(weather_en: str) -> str:
     if not weather_en:
-        return "🌤 Стандартная"
-    return f"🌤 {weather_en}"
-    # return weather_translations.get(weather_en, f"🌤 {weather_en}")
+        return "❓ Не активно"
+    return weather_translations.get(weather_en, f"🌤 {weather_en}")
 
 def format_weather_message(weather: str) -> str:
     if not weather:
@@ -86,64 +85,29 @@ def format_stock_change_message(item: str, old_count: int, new_count: int) -> st
         return f"📉 **{item}** купили!\n📊 Было: {old_count} → Осталось: {new_count} (-{decrease})"
     return None
 
-async def websocket_listener():
-    """Глобальный WebSocket слушатель - один на всех"""
+def update_global_data(new_stock, new_weather):
+    """Обновляет глобальные данные и отправляет уведомления"""
     global current_global_stock, current_global_weather, last_update_time, data_cache
     
-    while websocket_running:
-        try:
-            async with websockets.connect(uri) as websocket:
-                print("✅ WebSocket подключён")
-                
-                while websocket_running:
-                    try:
-                        data = await websocket.recv()
-                        json_data = json.loads(data)
-                        
-                        if 'type' in json_data and json_data['type'] == 'Welcome':
-                            # Обновляем данные магазина
-                            shops = json_data['fullState']['child']['data']['shops']
-                            inventory = shops['seed']['inventory']
-                            
-                            new_stock = {}
-                            for item in inventory:
-                                new_stock[item['species']] = item['initialStock']
-                            
-                            # Обновляем погоду
-                            new_weather = json_data['fullState']['child']['data'].get('weather')
-                            
-                            # Обновляем кэш
-                            with websocket_lock:
-                                old_stock = current_global_stock.copy()
-                                old_weather = current_global_weather
-                                
-                                current_global_stock = new_stock
-                                current_global_weather = new_weather
-                                last_update_time = datetime.now()
-                                
-                                data_cache['stock'] = new_stock.copy()
-                                data_cache['weather'] = new_weather
-                                data_cache['timestamp'] = time.time()
-                            
-                            # Отправляем уведомления подписчикам
-                            notify_subscribers(old_stock, new_stock, old_weather, new_weather)
-                            
-                    except json.JSONDecodeError as e:
-                        print(f"Ошибка парсинга JSON: {e}")
-                        continue
-                    except Exception as e:
-                        print(f"Ошибка обработки сообщения: {e}")
-                        continue
-                        
-        except Exception as e:
-            print(f"❌ Ошибка WebSocket: {e}")
-            print("🔄 Переподключение через 5 секунд...")
-            await asyncio.sleep(5)
+    with data_lock:
+        old_stock = current_global_stock.copy()
+        old_weather = current_global_weather
+        
+        current_global_stock = new_stock
+        current_global_weather = new_weather
+        last_update_time = datetime.now()
+        
+        data_cache['stock'] = new_stock.copy()
+        data_cache['weather'] = new_weather
+        data_cache['timestamp'] = time.time()
+    
+    # Отправляем уведомления (вне блокировки)
+    notify_subscribers(old_stock, new_stock, old_weather, new_weather)
 
 def notify_subscribers(old_stock, new_stock, old_weather, new_weather):
-    """Отправляет уведомления всем подписчикам об изменениях"""
+    """Отправляет уведомления всем подписчикам"""
     
-    # Проверяем изменения товаров
+    # Находим изменения товаров
     all_items = set(old_stock.keys()) | set(new_stock.keys())
     stock_changes = []
     
@@ -153,56 +117,99 @@ def notify_subscribers(old_stock, new_stock, old_weather, new_weather):
         if old_count != new_count:
             stock_changes.append((item, old_count, new_count))
     
-    # Проверяем изменения погоды
     weather_changed = old_weather != new_weather
     
-    # Если нет изменений - выходим
     if not stock_changes and not weather_changed:
         return
     
     # Отправляем уведомления каждому пользователю
-    for chat_id, subs in subscriptions.items():
-        if not subs['items'] and not subs['weather']:
-            continue
-        
-        # Уведомления о товарах
-        for item, old_count, new_count in stock_changes:
-            if item in subs['items'] or '*' in subs['items']:
-                try:
+    for chat_id, subs in list(subscriptions.items()):
+        try:
+            # Уведомления о товарах
+            for item, old_count, new_count in stock_changes:
+                if item in subs['items'] or '*' in subs['items']:
                     msg = format_stock_change_message(item, old_count, new_count)
                     if msg:
                         bot.send_message(chat_id, msg, parse_mode='Markdown')
-                        time.sleep(0.1)  # Небольшая задержка чтобы не флудить
-                except Exception as e:
-                    print(f"Ошибка отправки уведомления пользователю {chat_id}: {e}")
-        
-        # Уведомление о погоде
-        if subs['weather'] and weather_changed:
-            try:
+                        time.sleep(0.05)
+            
+            # Уведомление о погоде
+            if subs['weather'] and weather_changed:
                 msg = format_weather_change_message(old_weather, new_weather)
                 if msg:
                     bot.send_message(chat_id, msg, parse_mode='Markdown')
-            except Exception as e:
-                print(f"Ошибка отправки уведомления о погоде пользователю {chat_id}: {e}")
+        except Exception as e:
+            print(f"Ошибка отправки пользователю {chat_id}: {e}")
+
+async def websocket_listener():
+    """WebSocket слушатель - работает в отдельном потоке с своим event loop"""
+    global websocket_connected
+    
+    while True:
+        try:
+            print("🔄 Подключение к WebSocket...")
+            async with websockets.connect(
+                uri,
+                ping_interval=20,
+                ping_timeout=60,
+                close_timeout=10
+            ) as websocket:
+                print("✅ WebSocket подключён успешно!")
+                websocket_connected = True
+                
+                while True:
+                    try:
+                        message = await websocket.recv()
+                        data = json.loads(message)
+                        
+                        if data.get('type') == 'Welcome':
+                            # Получаем данные магазина
+                            shops = data['fullState']['child']['data']['shops']
+                            inventory = shops['seed']['inventory']
+                            
+                            new_stock = {}
+                            for item in inventory:
+                                new_stock[item['species']] = item['initialStock']
+                            
+                            # Получаем погоду
+                            new_weather = data['fullState']['child']['data'].get('weather')
+                            
+                            # Обновляем глобальные данные
+                            update_global_data(new_stock, new_weather)
+                            
+                    except websockets.exceptions.ConnectionClosed:
+                        print("❌ WebSocket соединение закрыто")
+                        break
+                    except json.JSONDecodeError as e:
+                        print(f"Ошибка JSON: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"Ошибка обработки: {e}")
+                        continue
+                        
+        except Exception as e:
+            print(f"❌ Ошибка WebSocket: {e}")
+            websocket_connected = False
+            print("🔄 Переподключение через 5 секунд...")
+            await asyncio.sleep(5)
+
+def run_websocket():
+    """Запускает WebSocket в отдельном потоке"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(websocket_listener())
 
 def get_cached_data():
-    """Возвращает кэшированные данные (мгновенно)"""
-    with websocket_lock:
+    """Быстрое получение кэшированных данных"""
+    with data_lock:
         if data_cache['timestamp'] > 0:
             return {
                 'stock': data_cache['stock'].copy(),
                 'weather': data_cache['weather']
             }
-        return None
+    return None
 
-def start_websocket_thread():
-    """Запускает WebSocket слушатель в отдельном потоке"""
-    def run_websocket():
-        asyncio.run(websocket_listener())
-    
-    thread = threading.Thread(target=run_websocket, daemon=True)
-    thread.start()
-    return thread
+# ============ ОБРАБОТЧИКИ КОМАНД ============
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -439,9 +446,11 @@ def items_command(message):
 def status_command(message):
     chat_id = message.chat.id
     
+    active_users = sum(1 for s in subscriptions.values() if s['items'] or s['weather'])
+    
     message_text = "📊 **Статус бота:**\n\n"
-    message_text += f"🟢 WebSocket: {'Подключён' if current_global_stock else 'Ожидание...'}\n"
-    message_text += f"👥 Активных пользователей: {len([s for s in subscriptions.values() if s['items'] or s['weather']])}\n"
+    message_text += f"🟢 WebSocket: {'Подключён ✅' if websocket_connected else 'Отключён ❌'}\n"
+    message_text += f"👥 Активных пользователей: {active_users}\n"
     message_text += f"🕐 Последнее обновление: {last_update_time.strftime('%H:%M:%S') if last_update_time else 'Нет данных'}\n"
     message_text += f"📦 Товаров в базе: {len(current_global_stock)}\n"
     message_text += f"🌤 Текущая погода: {translate_weather(current_global_weather) if current_global_weather else 'Не активна'}\n\n"
@@ -485,19 +494,27 @@ def help_command(message):
 """
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
-# Запуск бота
+# ============ ЗАПУСК ============
+
 if __name__ == "__main__":
     print("🤖 Запуск бота...")
     print("🌐 Подключение к WebSocket...")
     
-    # Запускаем глобальный WebSocket слушатель
-    websocket_thread = start_websocket_thread()
+    # Запускаем WebSocket в отдельном потоке
+    ws_thread = threading.Thread(target=run_websocket, daemon=True)
+    ws_thread.start()
     
-    # Даём время на первое подключение
+    # Ждём первого подключения
     time.sleep(3)
     
     print("✅ Бот готов к работе!")
-    print(f"📊 Статистика: Отслеживается {len(current_global_stock)} товаров")
+    print("📊 Бот запущен и принимает команды...")
     
-    # Запускаем бота
-    bot.polling(non_stop=True)
+    # Запускаем бота (неблокирующий polling с обработкой ошибок)
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=20)
+        except Exception as e:
+            print(f"❌ Ошибка в polling: {e}")
+            print("🔄 Перезапуск polling через 5 секунд...")
+            time.sleep(5)
