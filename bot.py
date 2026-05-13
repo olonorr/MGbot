@@ -16,11 +16,12 @@ current_global_stock = {}
 current_global_weather = None
 last_update_time = None
 websocket_connected = False
+data_ready = False  # Флаг готовности данных
 
 # Подписки пользователей
 subscriptions = defaultdict(lambda: {'items': set(), 'weather': False})
 
-# Кэш данных
+# Кэш данных (инициализируем заглушками)
 data_cache = {
     'stock': {},
     'weather': None,
@@ -29,6 +30,7 @@ data_cache = {
 
 # Lock для потокобезопасности
 data_lock = threading.Lock()
+ready_event = threading.Event()  # Событие для сигнала готовности данных
 
 weather_translations = {
     "Clear": "☀️ Ясно",
@@ -87,10 +89,10 @@ def format_stock_change_message(item: str, old_count: int, new_count: int) -> st
 
 def update_global_data(new_stock, new_weather):
     """Обновляет глобальные данные и отправляет уведомления"""
-    global current_global_stock, current_global_weather, last_update_time, data_cache
+    global current_global_stock, current_global_weather, last_update_time, data_cache, data_ready
     
     with data_lock:
-        old_stock = current_global_stock.copy()
+        old_stock = current_global_stock.copy() if current_global_stock else {}
         old_weather = current_global_weather
         
         current_global_stock = new_stock
@@ -100,9 +102,14 @@ def update_global_data(new_stock, new_weather):
         data_cache['stock'] = new_stock.copy()
         data_cache['weather'] = new_weather
         data_cache['timestamp'] = time.time()
+        
+        if not data_ready and new_stock:
+            data_ready = True
+            ready_event.set()  # Сигнализируем, что данные готовы
     
-    # Отправляем уведомления (вне блокировки)
-    notify_subscribers(old_stock, new_stock, old_weather, new_weather)
+    # Отправляем уведомления только если есть старые данные
+    if old_stock:
+        notify_subscribers(old_stock, new_stock, old_weather, new_weather)
 
 def notify_subscribers(old_stock, new_stock, old_weather, new_weather):
     """Отправляет уведомления всем подписчикам"""
@@ -157,6 +164,26 @@ async def websocket_listener():
                 print("✅ WebSocket подключён успешно!")
                 websocket_connected = True
                 
+                # Инициализируем данные первым сообщением
+                first_message = await websocket.recv()
+                data = json.loads(first_message)
+                
+                if data.get('type') == 'Welcome':
+                    # Получаем данные магазина
+                    shops = data['fullState']['child']['data']['shops']
+                    inventory = shops['seed']['inventory']
+                    
+                    new_stock = {}
+                    for item in inventory:
+                        new_stock[item['species']] = item['initialStock']
+                    
+                    # Получаем погоду
+                    new_weather = data['fullState']['child']['data'].get('weather')
+                    
+                    # Обновляем глобальные данные
+                    update_global_data(new_stock, new_weather)
+                    print(f"📊 Инициализировано: {len(new_stock)} товаров, погода: {new_weather}")
+                
                 while True:
                     try:
                         message = await websocket.recv()
@@ -190,6 +217,7 @@ async def websocket_listener():
         except Exception as e:
             print(f"❌ Ошибка WebSocket: {e}")
             websocket_connected = False
+            data_ready = False
             print("🔄 Переподключение через 5 секунд...")
             await asyncio.sleep(5)
 
@@ -200,24 +228,44 @@ def run_websocket():
     loop.run_until_complete(websocket_listener())
 
 def get_cached_data():
-    """Быстрое получение кэшированных данных"""
+    """Быстрое получение кэшированных данных с ожиданием готовности"""
+    # Ждём готовности данных (максимум 10 секунд)
+    if not data_ready:
+        ready_event.wait(timeout=10)
+    
     with data_lock:
-        if data_cache['timestamp'] > 0:
+        if data_cache['timestamp'] > 0 and data_cache['stock']:
             return {
                 'stock': data_cache['stock'].copy(),
                 'weather': data_cache['weather']
             }
     return None
 
+def wait_for_data(timeout=10):
+    """Ожидает загрузки данных"""
+    start_time = time.time()
+    while not data_ready and (time.time() - start_time) < timeout:
+        time.sleep(0.5)
+    return data_ready
+
 # ============ ОБРАБОТЧИКИ КОМАНД ============
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
     chat_id = message.chat.id
+    
+    # Отправляем сообщение о загрузке
+    msg = bot.send_message(chat_id, "🔄 Загрузка данных магазина, пожалуйста подождите...")
+    
+    # Ждём данные
+    if not wait_for_data(10):
+        bot.edit_message_text("❌ Не удалось загрузить данные. Попробуйте позже.", chat_id, msg.message_id)
+        return
+    
     data = get_cached_data()
     
-    if not data:
-        bot.send_message(chat_id, "🔄 Данные загружаются, пожалуйста, подождите 5 секунд...")
+    if not data or not data.get('stock'):
+        bot.edit_message_text("❌ Не удалось получить данные. Попробуйте позже.", chat_id, msg.message_id)
         return
     
     stock = data.get('stock', {})
@@ -239,11 +287,17 @@ def start_command(message):
         message_text += "❌ Нет товаров в наличии"
     
     message_text += "\n\n💡 **Команды:** /help"
-    bot.send_message(chat_id, message_text)
+    
+    bot.edit_message_text(message_text, chat_id, msg.message_id, parse_mode='Markdown')
 
 @bot.message_handler(commands=['weather'])
 def weather_command(message):
     chat_id = message.chat.id
+    
+    if not wait_for_data(5):
+        bot.send_message(chat_id, "🔄 Данные загружаются, попробуйте через пару секунд")
+        return
+    
     data = get_cached_data()
     
     if not data:
@@ -259,20 +313,25 @@ def weather_command(message):
         message_text = "🌤 **Погодное событие не активно**\n\n"
         message_text += "Подпишитесь на уведомления: `/subscribe_weather`"
     
-    bot.send_message(chat_id, message_text)
+    bot.send_message(chat_id, message_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['subscribe_weather'])
 def subscribe_weather(message):
     chat_id = message.chat.id
     
+    # Ждём данные для отображения текущей погоды
+    wait_for_data(3)
+    
     if subscriptions[chat_id]['weather']:
         bot.send_message(chat_id, "ℹ️ Вы уже подписаны на уведомления о погоде")
     else:
         subscriptions[chat_id]['weather'] = True
+        weather_text = translate_weather(current_global_weather) if current_global_weather else 'Не активна'
         bot.send_message(
             chat_id,
             f"✅ Вы подписались на уведомления о погоде!\n\n"
-            f"Текущая погода: {translate_weather(current_global_weather) if current_global_weather else 'Не активна'}"
+            f"Текущая погода: {weather_text}",
+            parse_mode='Markdown'
         )
 
 @bot.message_handler(commands=['unsubscribe_weather'])
@@ -297,7 +356,8 @@ def subscribe_command(message):
             "Примеры:\n"
             "`/subscribe Carrot`\n"
             "`/subscribe *` - все товары\n\n"
-            "Для погоды: `/subscribe_weather`"
+            "Для погоды: `/subscribe_weather`",
+            parse_mode='Markdown'
         )
         return
     
@@ -308,8 +368,14 @@ def subscribe_command(message):
         bot.send_message(
             chat_id,
             "✅ Вы подписались на **ВСЕ товары**!\n\n"
-            "Бот будет присылать уведомления о любых изменениях в магазине."
+            "Бот будет присылать уведомления о любых изменениях в магазине.",
+            parse_mode='Markdown'
         )
+        return
+    
+    # Ждём данные для проверки существования товара
+    if not wait_for_data(5):
+        bot.send_message(chat_id, "🔄 Данные загружаются, попробуйте через пару секунд")
         return
     
     data = get_cached_data()
@@ -326,14 +392,15 @@ def subscribe_command(message):
         return
     
     if item_name in subscriptions[chat_id]['items']:
-        bot.send_message(chat_id, f"ℹ️ Вы уже подписаны на товар **{item_name}**")
+        bot.send_message(chat_id, f"ℹ️ Вы уже подписаны на товар **{item_name}**", parse_mode='Markdown')
     else:
         subscriptions[chat_id]['items'].add(item_name)
         current_count = stock.get(item_name, 0)
         bot.send_message(
             chat_id,
             f"✅ Вы подписались на товар **{item_name}**\n\n"
-            f"Текущее количество: {current_count} шт."
+            f"Текущее количество: {current_count} шт.",
+            parse_mode='Markdown'
         )
 
 @bot.message_handler(commands=['unsubscribe'])
@@ -342,7 +409,7 @@ def unsubscribe_command(message):
     args = message.text.split(maxsplit=1)
     
     if len(args) < 2:
-        bot.send_message(chat_id, "❌ Укажите название товара.\nПример: `/unsubscribe Carrot`")
+        bot.send_message(chat_id, "❌ Укажите название товара.\nПример: `/unsubscribe Carrot`", parse_mode='Markdown')
         return
     
     item_name = args[1].strip()
@@ -353,10 +420,10 @@ def unsubscribe_command(message):
         return
     
     if item_name not in subscriptions[chat_id]['items']:
-        bot.send_message(chat_id, f"ℹ️ Вы не подписаны на товар **{item_name}**")
+        bot.send_message(chat_id, f"ℹ️ Вы не подписаны на товар **{item_name}**", parse_mode='Markdown')
     else:
         subscriptions[chat_id]['items'].discard(item_name)
-        bot.send_message(chat_id, f"✅ Вы отписались от товара **{item_name}**")
+        bot.send_message(chat_id, f"✅ Вы отписались от товара **{item_name}**", parse_mode='Markdown')
 
 @bot.message_handler(commands=['mysubs'])
 def list_subscriptions(message):
@@ -380,15 +447,22 @@ def list_subscriptions(message):
             for item in sorted(subs['items']):
                 message_text += f"  • {item}\n"
     
-    bot.send_message(chat_id, message_text)
+    bot.send_message(chat_id, message_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['check'])
 def check_command(message):
     chat_id = message.chat.id
+    
+    msg = bot.send_message(chat_id, "🔄 Получение данных...")
+    
+    if not wait_for_data(5):
+        bot.edit_message_text("🔄 Данные загружаются, попробуйте через пару секунд", chat_id, msg.message_id)
+        return
+    
     data = get_cached_data()
     
     if not data:
-        bot.send_message(chat_id, "🔄 Данные загружаются, попробуйте через пару секунд")
+        bot.edit_message_text("❌ Не удалось получить данные", chat_id, msg.message_id)
         return
     
     stock = data.get('stock', {})
@@ -408,17 +482,24 @@ def check_command(message):
     else:
         message_text += "❌ Нет товаров в наличии"
     
-    message_text += f"\n\n🕐 Обновлено: {datetime.now().strftime('%H:%M:%S')}"
+    message_text += f"\n\n🕐 Обновлено: {last_update_time.strftime('%H:%M:%S') if last_update_time else 'только что'}"
     
-    bot.send_message(chat_id, message_text)
+    bot.edit_message_text(message_text, chat_id, msg.message_id, parse_mode='Markdown')
 
 @bot.message_handler(commands=['items'])
 def items_command(message):
     chat_id = message.chat.id
+    
+    msg = bot.send_message(chat_id, "🔄 Загрузка списка товаров...")
+    
+    if not wait_for_data(5):
+        bot.edit_message_text("🔄 Данные загружаются, попробуйте через пару секунд", chat_id, msg.message_id)
+        return
+    
     data = get_cached_data()
     
     if not data:
-        bot.send_message(chat_id, "🔄 Данные загружаются, попробуйте через пару секунд")
+        bot.edit_message_text("❌ Не удалось получить список товаров", chat_id, msg.message_id)
         return
     
     stock = data.get('stock', {})
@@ -440,7 +521,7 @@ def items_command(message):
         if len(unavailable) > 10:
             message_text += f"\n... и {len(unavailable) - 10} других"
     
-    bot.send_message(chat_id, message_text)
+    bot.edit_message_text(message_text, chat_id, msg.message_id, parse_mode='Markdown')
 
 @bot.message_handler(commands=['status'])
 def status_command(message):
@@ -450,13 +531,14 @@ def status_command(message):
     
     message_text = "📊 **Статус бота:**\n\n"
     message_text += f"🟢 WebSocket: {'Подключён ✅' if websocket_connected else 'Отключён ❌'}\n"
+    message_text += f"📦 Данные: {'Готовы ✅' if data_ready else 'Загружаются ⏳'}\n"
     message_text += f"👥 Активных пользователей: {active_users}\n"
     message_text += f"🕐 Последнее обновление: {last_update_time.strftime('%H:%M:%S') if last_update_time else 'Нет данных'}\n"
     message_text += f"📦 Товаров в базе: {len(current_global_stock)}\n"
     message_text += f"🌤 Текущая погода: {translate_weather(current_global_weather) if current_global_weather else 'Не активна'}\n\n"
     message_text += f"💡 Используйте /help для списка команд"
     
-    bot.send_message(chat_id, message_text)
+    bot.send_message(chat_id, message_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['help'])
 def help_command(message):
@@ -504,13 +586,17 @@ if __name__ == "__main__":
     ws_thread = threading.Thread(target=run_websocket, daemon=True)
     ws_thread.start()
     
-    # Ждём первого подключения
-    time.sleep(3)
+    # Ждём первого подключения и получения данных
+    print("⏳ Ожидание загрузки данных...")
+    if ready_event.wait(timeout=15):
+        print("✅ Данные успешно загружены!")
+    else:
+        print("⚠️ Внимание: данные не загрузились в течение 15 секунд")
     
     print("✅ Бот готов к работе!")
     print("📊 Бот запущен и принимает команды...")
     
-    # Запускаем бота (неблокирующий polling с обработкой ошибок)
+    # Запускаем бота
     while True:
         try:
             bot.polling(none_stop=True, interval=1, timeout=20)
