@@ -4,6 +4,7 @@ import json
 import asyncio
 import threading
 import time
+from datetime import datetime
 
 bot = telebot.TeleBot("8538742738:AAF2QqkbRkMueE1fOg-n7Yb1EFRRnXOjPV4")
 uri = "wss://magicgarden.gg/version/311/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22311%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
@@ -56,12 +57,27 @@ def format_stock_message(stock_dict: dict) -> str:
         return "Не удалось получить данные о товарах"
     
     message = "📦 **Товары в магазине:**\n\n"
-    for item, count in stock_dict.items():
+    # Сортируем по названию для удобства
+    for item, count in sorted(stock_dict.items()):
         if count > 0:
             message += f"✅ {item} - {count}\n"
         else:
-            message += f"❌ {item} - {count}\n"
+            message += f"❌ {item} - 0\n"
     return message
+
+def format_change_message(item: str, old_count: int, new_count: int) -> str:
+    """Форматирует сообщение об изменении количества товара"""
+    if old_count == 0 and new_count > 0:
+        return f"🎉 **{item}** появился в продаже!\n📊 Количество: {new_count}\n⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
+    elif old_count > 0 and new_count == 0:
+        return f"⚠️ **{item}** закончился в магазине!\n⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
+    elif new_count > old_count:
+        increase = new_count - old_count
+        return f"📈 **{item}** добавлено в продажу!\n📊 Было: {old_count} → Стало: {new_count} (+{increase})\n⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
+    elif new_count < old_count:
+        decrease = old_count - new_count
+        return f"📉 **{item}** купили!\n📊 Было: {old_count} → Осталось: {new_count} (-{decrease})\n⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
+    return None
 
 def monitor_shop(chat_id):
     """Функция для мониторинга магазина в отдельном потоке"""
@@ -71,84 +87,149 @@ def monitor_shop(chat_id):
     if chat_id not in last_stock_state:
         last_stock_state[chat_id] = {}
     
+    # Первая проверка для получения начального состояния
+    initial_stock = get_current_stock()
+    if initial_stock:
+        last_stock_state[chat_id] = initial_stock.copy()
+    
     while monitoring_threads.get(chat_id, False):
         current_stock = get_current_stock()
         
         if current_stock:
-            # Проверяем подписки пользователя
-            user_subs = subscriptions.get(chat_id, [])
+            # Получаем все товары (объединяем ключи из старого и нового состояния)
+            all_items = set(last_stock_state[chat_id].keys()) | set(current_stock.keys())
             
-            for item in user_subs:
+            # Отслеживаем изменения для КАЖДОГО товара
+            changes = []
+            for item in all_items:
                 old_count = last_stock_state[chat_id].get(item, 0)
                 new_count = current_stock.get(item, 0)
                 
-                # Если товара не было, а теперь появился (количество > 0)
-                if old_count == 0 and new_count > 0:
-                    bot.send_message(
-                        chat_id,
-                        f"🎉 **{item}** появился в продаже!\nКоличество: {new_count}\nСпешите купить!"
-                    )
-                # Если количество увеличилось с 0 до чего-то (альтернативная проверка)
-                elif new_count > 0 and old_count == 0:
-                    bot.send_message(
-                        chat_id,
-                        f"🎉 **{item}** теперь доступен для покупки!\nКоличество: {new_count}"
-                    )
+                # Если количество изменилось
+                if old_count != new_count:
+                    changes.append((item, old_count, new_count))
+            
+            # Отправляем сообщения об изменениях
+            for item, old_count, new_count in changes:
+                # Проверяем подписки пользователя
+                user_subs = subscriptions.get(chat_id, [])
+                
+                # Отправляем уведомление если:
+                # 1. Пользователь подписан на этот товар, ИЛИ
+                # 2. Пользователь подписан на "все товары" (специальный режим)
+                if item in user_subs or "*" in user_subs:
+                    change_msg = format_change_message(item, old_count, new_count)
+                    if change_msg:
+                        bot.send_message(chat_id, change_msg, parse_mode='Markdown')
             
             # Обновляем последнее состояние
             last_stock_state[chat_id] = current_stock.copy()
         
-        # Проверяем каждые 30 секунд
-        time.sleep(30)
+        # Проверяем каждые 15 секунд (чаще для отслеживания быстрых изменений)
+        time.sleep(15)
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
     chat_id = message.chat.id
     stock = get_current_stock()
     
+    bot.send_message(chat_id, "🔄 Получение данных о магазине...")
+    
     if stock:
-        bot.send_message(chat_id, format_stock_message(stock))
+        # Показываем ТОЛЬКО товары в наличии (с количеством > 0)
+        available_items = {k: v for k, v in stock.items() if v > 0}
+        if available_items:
+            message_text = "✅ **Товары в наличии:**\n\n"
+            for item, count in sorted(available_items.items()):
+                message_text += f"• {item}: {count} шт.\n"
+        else:
+            message_text = "❌ В магазине нет товаров в наличии"
+        
+        message_text += f"\n📊 Всего товаров в магазине: {len(stock)}\n"
+        message_text += f"📦 Доступно для покупки: {len(available_items)}\n\n"
+        message_text += "💡 Используйте /help для списка команд"
+        
+        bot.send_message(chat_id, message_text)
     else:
         bot.send_message(chat_id, "❌ Не удалось получить данные о магазине. Попробуйте позже.")
 
 @bot.message_handler(commands=['subscribe'])
 def subscribe_command(message):
-    """Подписка на товар: /subscribe Carrot"""
+    """Подписка на товар: /subscribe Carrot или /subscribe * для всех товаров"""
     chat_id = message.chat.id
     args = message.text.split(maxsplit=1)
     
     if len(args) < 2:
         bot.send_message(
             chat_id,
-            "❌ Укажите название товара.\nПример: `/subscribe Carrot`\n\n📋 Доступные товары:\n" +
-            "\n".join(get_item_list()[:20])
+            "❌ Укажите название товара.\n\n"
+            "Примеры:\n"
+            "`/subscribe Carrot` - подписка на конкретный товар\n"
+            "`/subscribe *` - подписка на ВСЕ товары\n\n"
+            "Используйте `/items` для просмотра всех товаров"
         )
         return
     
     item_name = args[1].strip()
     
-    # Получаем список всех доступных товаров
+    # Проверка на подписку на все товары
+    if item_name == "*":
+        if chat_id not in subscriptions:
+            subscriptions[chat_id] = []
+        
+        if "*" in subscriptions[chat_id]:
+            bot.send_message(chat_id, "ℹ️ Вы уже подписаны на ВСЕ товары")
+        else:
+            subscriptions[chat_id].append("*")
+            # Удаляем другие подписки, так как подписка на всё их заменяет
+            subscriptions[chat_id] = ["*"]
+            bot.send_message(
+                chat_id,
+                "✅ Вы подписались на **ВСЕ товары**!\n\n"
+                "Бот будет присылать уведомления о ЛЮБЫХ изменениях:\n"
+                "• Появление товара\n"
+                "• Изменение количества\n"
+                "• Исчезновение товара\n\n"
+                "Используйте `/unsubscribe *` для отписки"
+            )
+            
+            # Запускаем мониторинг
+            if chat_id not in monitoring_threads or not monitoring_threads[chat_id]:
+                monitoring_threads[chat_id] = True
+                thread = threading.Thread(target=monitor_shop, args=(chat_id,), daemon=True)
+                thread.start()
+        return
+    
+    # Обычная подписка
     stock = get_current_stock()
     if stock and item_name not in stock:
+        # Показываем похожие товары для подсказки
+        similar = [name for name in stock.keys() if item_name.lower() in name.lower()][:5]
+        hint = f"\n\nВозможно, вы имели в виду:\n" + "\n".join([f"• {s}" for s in similar]) if similar else ""
+        
         bot.send_message(
             chat_id,
-            f"❌ Товар '{item_name}' не найден.\n\nДоступные товары:\n" +
-            "\n".join(list(stock.keys())[:30])
+            f"❌ Товар '{item_name}' не найден.{hint}\n\n"
+            f"Используйте `/items` для просмотра всех {len(stock)} товаров"
         )
         return
     
-    # Добавляем подписку
     if chat_id not in subscriptions:
         subscriptions[chat_id] = []
     
+    # Проверяем, не подписан ли уже
     if item_name in subscriptions[chat_id]:
         bot.send_message(chat_id, f"ℹ️ Вы уже подписаны на товар **{item_name}**")
     else:
         subscriptions[chat_id].append(item_name)
         bot.send_message(
             chat_id,
-            f"✅ Вы подписались на товар **{item_name}**\n"
-            f"Бот пришлёт уведомление, когда он появится в продаже."
+            f"✅ Вы подписались на товар **{item_name}**\n\n"
+            f"Бот будет присылать уведомления, когда:\n"
+            f"• Товар появится в продаже\n"
+            f"• Количество товара изменится\n"
+            f"• Товар закончится\n\n"
+            f"Текущее количество: {stock.get(item_name, 0)} шт."
         )
         
         # Запускаем поток мониторинга для этого чата, если его ещё нет
@@ -159,28 +240,35 @@ def subscribe_command(message):
 
 @bot.message_handler(commands=['unsubscribe'])
 def unsubscribe_command(message):
-    """Отписка от товара: /unsubscribe Carrot"""
+    """Отписка от товара: /unsubscribe Carrot или /unsubscribe *"""
     chat_id = message.chat.id
     args = message.text.split(maxsplit=1)
     
     if len(args) < 2:
         bot.send_message(
             chat_id,
-            "❌ Укажите название товара.\nПример: `/unsubscribe Carrot`"
+            "❌ Укажите название товара.\n"
+            "Примеры:\n"
+            "`/unsubscribe Carrot`\n"
+            "`/unsubscribe *` - отписаться от всех товаров"
         )
         return
     
     item_name = args[1].strip()
     
-    if chat_id not in subscriptions or item_name not in subscriptions[chat_id]:
+    if chat_id not in subscriptions:
+        subscriptions[chat_id] = []
+    
+    if item_name not in subscriptions[chat_id]:
         bot.send_message(chat_id, f"ℹ️ Вы не подписаны на товар **{item_name}**")
     else:
         subscriptions[chat_id].remove(item_name)
         bot.send_message(chat_id, f"✅ Вы отписались от товара **{item_name}**")
         
-        # Если больше нет подписок, можно остановить мониторинг
+        # Если больше нет подписок, останавливаем мониторинг
         if not subscriptions[chat_id]:
             monitoring_threads[chat_id] = False
+            bot.send_message(chat_id, "🔕 Мониторинг остановлен (нет активных подписок)")
 
 @bot.message_handler(commands=['mysubs'])
 def list_subscriptions(message):
@@ -188,15 +276,29 @@ def list_subscriptions(message):
     chat_id = message.chat.id
     
     if chat_id not in subscriptions or not subscriptions[chat_id]:
-        bot.send_message(chat_id, "📭 У вас нет активных подписок.\nИспользуйте `/subscribe НазваниеТовара`")
-    else:
-        subs_list = "\n".join([f"• {item}" for item in subscriptions[chat_id]])
         bot.send_message(
-            chat_id,
-            f"📋 **Ваши подписки:**\n\n{subs_list}\n\n"
-            f"➖ Чтобы отписаться: `/unsubscribe НазваниеТовара`\n"
-            f"➖ Чтобы проверить магазин: `/check`"
+            chat_id, 
+            "📭 У вас нет активных подписок.\n\n"
+            "Используйте:\n"
+            "`/subscribe НазваниеТовара` - подписка на товар\n"
+            "`/subscribe *` - подписка на все товары\n"
+            "`/items` - список товаров"
         )
+        return
+    
+    subs_list = []
+    for item in subscriptions[chat_id]:
+        if item == "*":
+            subs_list.append("🌟 **ВСЕ ТОВАРЫ**")
+        else:
+            subs_list.append(f"• {item}")
+    
+    bot.send_message(
+        chat_id,
+        f"📋 **Ваши подписки:**\n\n" + "\n".join(subs_list) + "\n\n"
+        f"➖ Чтобы отписаться: `/unsubscribe НазваниеТовара`\n"
+        f"➖ Чтобы проверить магазин: `/check`"
+    )
 
 @bot.message_handler(commands=['check'])
 def check_shop(message):
@@ -206,7 +308,27 @@ def check_shop(message):
     
     stock = get_current_stock()
     if stock:
-        bot.send_message(chat_id, format_stock_message(stock))
+        # Показываем все товары с количеством
+        message_text = "🏪 **Текущее состояние магазина:**\n\n"
+        
+        # Товары в наличии
+        available = {k: v for k, v in stock.items() if v > 0}
+        if available:
+            message_text += "✅ **В наличии:**\n"
+            for item, count in sorted(available.items()):
+                message_text += f"  • {item}: {count} шт.\n"
+        else:
+            message_text += "❌ Нет товаров в наличии\n"
+        
+        # Товары которых нет
+        unavailable = {k: v for k, v in stock.items() if v == 0}
+        if unavailable:
+            message_text += f"\n❌ **Отсутствуют ({len(unavailable)}):**\n"
+            message_text += "  " + ", ".join(sorted(unavailable.keys())[:10])
+            if len(unavailable) > 10:
+                message_text += f" и {len(unavailable) - 10} других"
+        
+        bot.send_message(chat_id, message_text)
     else:
         bot.send_message(chat_id, "❌ Не удалось получить данные. Попробуйте позже.")
 
@@ -214,44 +336,102 @@ def check_shop(message):
 def list_items(message):
     """Показать список всех доступных товаров"""
     chat_id = message.chat.id
+    bot.send_message(chat_id, "🔄 Загрузка списка товаров...")
+    
     stock = get_current_stock()
     
     if stock:
-        items_list = "\n".join([f"• {item}" for item in sorted(stock.keys())])
-        bot.send_message(
-            chat_id,
-            f"📋 **Доступные товары для подписки:**\n\n{items_list}\n\n"
-            f"💡 Используйте: `/subscribe НазваниеТовара`"
-        )
+        # Группируем по наличию
+        available = [item for item, count in stock.items() if count > 0]
+        unavailable = [item for item, count in stock.items() if count == 0]
+        
+        message_text = f"📋 **Доступные товары ({len(stock)}):**\n\n"
+        
+        if available:
+            message_text += f"✅ **В наличии ({len(available)}):**\n"
+            message_text += "• " + "\n• ".join(sorted(available)[:20])
+            if len(available) > 20:
+                message_text += f"\n... и {len(available) - 20} других"
+            message_text += "\n\n"
+        
+        if unavailable:
+            message_text += f"❌ **Отсутствуют ({len(unavailable)}):**\n"
+            message_text += "• " + "\n• ".join(sorted(unavailable)[:10])
+            if len(unavailable) > 10:
+                message_text += f"\n... и {len(unavailable) - 10} других"
+        
+        message_text += "\n\n💡 Используйте:\n"
+        message_text += "`/subscribe НазваниеТовара` - подписаться на товар\n"
+        message_text += "`/subscribe *` - подписаться на ВСЕ товары"
+        
+        bot.send_message(chat_id, message_text)
     else:
         bot.send_message(chat_id, "❌ Не удалось получить список товаров")
 
-def get_item_list():
-    """Возвращает список доступных товаров для подсказки"""
-    stock = get_current_stock()
-    return list(stock.keys()) if stock else []
+@bot.message_handler(commands=['status'])
+def monitoring_status(message):
+    """Показать статус мониторинга"""
+    chat_id = message.chat.id
+    is_monitoring = monitoring_threads.get(chat_id, False)
+    subs_count = len(subscriptions.get(chat_id, []))
+    
+    if is_monitoring:
+        status = "🟢 **Активен**"
+    else:
+        status = "🔴 **Остановлен**"
+    
+    bot.send_message(
+        chat_id,
+        f"📊 **Статус мониторинга:**\n\n"
+        f"Состояние: {status}\n"
+        f"Активных подписок: {subs_count}\n"
+        f"Частота проверки: каждые 15 секунд\n\n"
+        f"• `/check` - проверить магазин\n"
+        f"• `/mysubs` - мои подписки\n"
+        f"• `/subscribe *` - подписаться на всё"
+    )
 
 @bot.message_handler(commands=['help'])
 def help_command(message):
     help_text = """
-🤖 **Доступные команды:**
+🤖 **Magic Garden Shop Bot - Справка**
 
-/start - Показать текущее состояние магазина
-/check - Проверить магазин (обновлённые данные)
-/subscribe [товар] - Подписаться на появление товара
+📌 **Основные команды:**
+
+/start - Начало работы, показать доступные товары
+/check - Проверить текущее состояние магазина
+/status - Статус мониторинга
+
+📌 **Подписки:**
+
+/subscribe [товар] - Подписаться на товар
+   Пример: `/subscribe Carrot`
+   
+/subscribe * - Подписаться на ВСЕ товары
+   Будет присылать уведомления о ЛЮБЫХ изменениях
+
 /unsubscribe [товар] - Отписаться от товара
-/mysubs - Показать ваши подписки
-/items - Показать список всех доступных товаров
-/help - Показать эту справку
+/unsubscribe * - Отписаться от всех товаров
 
-📝 **Пример:**
-`/subscribe Carrot` - бот пришлёт уведомление, когда морковь появится в продаже
+/mysubs - Показать все активные подписки
+/items - Показать список всех товаров
 
-⚠️ Бот проверяет магазин каждые 30 секунд
+📌 **Что отслеживается:**
+
+✅ Появление товара в продаже
+📈 Увеличение количества товара
+📉 Уменьшение количества (кто-то купил)
+⚠️ Исчезновение товара из продажи
+
+⏱️ **Частота проверки:** каждые 15 секунд
+
+💡 **Совет:** Подпишитесь на `*` чтобы видеть все изменения в магазине
 """
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
 # Запуск бота
 if __name__ == "__main__":
-    print("Бот запущен...")
+    print("🤖 Бот запущен...")
+    print(f"📡 WebSocket URI: {uri[:50]}...")
+    print("✅ Готов к работе!")
     bot.polling(non_stop=True)
