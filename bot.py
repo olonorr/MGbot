@@ -165,9 +165,7 @@ async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
                         # Проверяем обновления
                         await notifier.check_for_updates(context, json_data)
                     
-                    except websockets.exceptions.ConnectionClosedError as e:
-                        print(f"Версия {version} не подходит: {e}")
-                        version = version+1
+                    
                     except asyncio.TimeoutError:
                         print("Ожидание данных...")
                         logger.info("Ожидание данных...")
@@ -179,6 +177,9 @@ async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         print(f"Ошибка обработки: {e}")
                         logger.error(f"Ошибка обработки: {e}")
+        except websockets.exceptions.ConnectionClosedError as e:
+                        print(f"Версия {version} не подходит: {e}")
+                        version = version+1
                         
         except Exception as e:
             print(f"Ошибка с версией {version}: {e}")
