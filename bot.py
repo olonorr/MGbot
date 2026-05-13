@@ -196,9 +196,9 @@ class ShopTrackerBot:
 shop_tracker = ShopTrackerBot()
 
 # Функция для обновления данных (может вызываться из другого потока)
-def update_game_data():
+def update_game_data(data):
     """Внешняя функция для обновления данных"""
-    shop_tracker.update_data(asyncio.run(get_data()))
+    shop_tracker.update_data(data)
 
 # Команды бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -653,7 +653,9 @@ if __name__ == "__main__":
         import random
         
         while True:
-            shop_tracker.update_data(asyncio.run(get_data()))
+            new_data = asyncio.run(get_data())
+            update_game_data(new_data)
+            shop_tracker.update_data(new_data)
             # Здесь должна быть ваша логика получения данных
             # Например, из WebSocket, API или другого источника
             time.sleep(5)  # Проверка каждые 10 секунд
