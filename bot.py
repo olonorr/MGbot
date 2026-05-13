@@ -95,7 +95,7 @@ class ShopTrackerBot:
         """Получает инвентарь магазина определенного типа"""
         inventory = {}
         try:
-            shops = data.get('child', {}).get('data', {}).get('shops', {})
+            shops = data.get('fullState', {}).get('child', {}).get('data', {}).get('shops', {})
             shop_data = shops.get(shop_type, {})
             
             for item in shop_data.get('inventory', []):
@@ -270,10 +270,8 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 
                 if available:
                     message += "\n".join(available) + "\n"
-                if unavailable and len(unavailable) <= 10:  # Показываем только если не слишком много
-                    message += "\n".join(unavailable[:5]) + "\n"
-                if len(unavailable) > 10:
-                    message += f"  ... и {len(unavailable) - 5} других\n"
+                if unavailable:  # Показываем только если не слишком много
+                    message += "\n".join(unavailable) + "\n"
     else:
         shop_names = {
             'seed': '🌱 Семена',
@@ -306,9 +304,8 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
             message += "❌ Нет товаров в наличии\n\n"
         
         if unavailable:
-            message += "**Нет в наличии:**\n" + "\n".join(unavailable[:20])
-            if len(unavailable) > 20:
-                message += f"\n... и {len(unavailable) - 20} других"
+            message += "**Нет в наличии:**\n" + "\n".join(unavailable)
+            
         
         # Добавляем кнопку для подписки
         keyboard = [[
@@ -661,9 +658,11 @@ if __name__ == "__main__":
             time.sleep(5)  # Проверка каждые 10 секунд
             # new_data = get_data_from_source()
             # shop_tracker.update_data(new_data)
+            print("ABOBA")
     
     # Запускаем поток обновления данных
     updater_thread = threading.Thread(target=data_updater, daemon=True)
     updater_thread.start()
+    
     
     main()
