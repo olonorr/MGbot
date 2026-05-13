@@ -3,3 +3,4 @@ telebot
 asyncio
 python-telegram-bot
 telegram
+python-telegram-bot[job-queue]
