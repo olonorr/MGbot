@@ -7,4 +7,5 @@ dependencies = [
     "telebot",
     "asyncio",
     "python-telegram-bot==20.7",
+    "telegram",
 ]
