@@ -144,17 +144,19 @@ class ShopNotifier:
 
 # Глобальный экземпляр уведомителя
 notifier = ShopNotifier()
+websocket_task = None
+latest_game_data = None
 
-async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
-    """Подключается к WebSocket и обрабатывает данные"""
+async def listen_and_notify():
+    """Подключается к WebSocket и обрабатывает данные (запускается один раз)"""
     versions_to_try = ["312", "313", "314", "315"]
     
     for version in versions_to_try:
         uri = f"wss://magicgarden.gg/version/{version}/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22{version}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
         
         try:
-            async with websockets.connect(uri, close_timeout=3) as websocket:
-                print(f"Подключено с версией {version}")
+            async with websockets.connect(uri, close_timeout=3, ping_interval=20, ping_timeout=60) as websocket:
+                print(f"✅ Подключено с версией {version}")
                 logger.info(f"Подключено с версией {version}")
                 
                 while True:
@@ -162,23 +164,29 @@ async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
                         data = await asyncio.wait_for(websocket.recv(), timeout=30)
                         json_data = json.loads(data)
                         
-                        # Проверяем обновления
-                        await notifier.check_for_updates(context, json_data)
+                        # Сохраняем последние данные
+                        global latest_game_data
+                        latest_game_data = json_data
                         
                     except asyncio.TimeoutError:
-                        print("Ожидание данных...")
+                        print("⏳ Ожидание данных...")
                         logger.info("Ожидание данных...")
                         continue
                     except websockets.exceptions.ConnectionClosed:
-                        print("Соединение закрыто, переподключение...")
+                        print("🔌 Соединение закрыто, переподключение...")
                         logger.warning("Соединение закрыто, переподключение...")
                         break
+                    except json.JSONDecodeError as e:
+                        print(f"❌ Ошибка парсинга JSON: {e}")
+                        logger.error(f"Ошибка парсинга JSON: {e}")
+                        continue
                     except Exception as e:
-                        print(f"Ошибка обработки: {e}")
+                        print(f"❌ Ошибка обработки: {e}")
                         logger.error(f"Ошибка обработки: {e}")
+                        continue
                         
         except Exception as e:
-            print(f"Ошибка с версией {version}: {e}")
+            print(f"❌ Ошибка с версией {version}: {e}")
             logger.error(f"Ошибка с версией {version}: {e}")
             continue
 
@@ -378,6 +386,26 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode='HTML')
 
+async def game_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job для проверки обновлений в последних данных"""
+    global latest_game_data
+    
+    if latest_game_data:
+        # Проверяем обновления с последними полученными данными
+        await notifier.check_for_updates(context, latest_game_data)
+    else:
+        logger.info("Нет данных от WebSocket для проверки")
+
+async def start_websocket_listener():
+    """Запускает WebSocket слушатель в отдельной задаче"""
+    try:
+        await listen_and_notify()
+    except Exception as e:
+        logger.error(f"Ошибка в WebSocket слушателе: {e}")
+        # Попытка переподключения через 30 секунд
+        await asyncio.sleep(30)
+        asyncio.create_task(start_websocket_listener())
+
 def main():
     """Запуск бота"""
     # Создание приложения
@@ -394,12 +422,17 @@ def main():
     application.add_handler(CommandHandler("my_subscriptions", my_subscriptions))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
+    # Запускаем WebSocket слушатель как отдельную корутину
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_websocket_listener())
+    
     # Добавление задачи мониторинга (каждые 10 секунд)
     job_queue = application.job_queue
     job_queue.run_repeating(game_monitor_job, interval=10, first=1)
     
     # Запуск бота
-    print("Бот запущен...")
+    print("🤖 Бот запущен...")
+    print("📡 Подключение к WebSocket...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
