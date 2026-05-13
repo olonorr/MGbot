@@ -4,12 +4,11 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Set, Optional
 from collections import defaultdict
+import threading
+import websockets
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import threading
-import time
-import websockets
 
 # Настройка логирования
 logging.basicConfig(
@@ -20,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_BOT_TOKEN = "8538742738:AAF2QqkbRkMueE1fOg-n7Yb1EFRRnXOjPV4"  # Замените на ваш токен
+
 
 version = 310
 
@@ -72,8 +72,11 @@ class ShopTrackerBot:
         self.user_subscriptions: Dict[int, Dict[str, Set[str]]] = defaultdict(
             lambda: defaultdict(set)
         )
+        # Структура: {user_id: {'seed': {'Carrot', 'Cabbage'}, 'tool': {'WateringCan'}, 'weather': {'weather'}}}
+        
         self.application = application
         self.update_lock = threading.Lock()
+        self.last_weather = None
         
     def set_application(self, application: Application):
         """Устанавливает экземпляр приложения для отправки сообщений"""
@@ -85,11 +88,11 @@ class ShopTrackerBot:
             old_data = self.global_json_data
             self.global_json_data = new_data
             
-            # Проверяем изменения в магазинах
+            # Проверяем изменения в магазинах и погоде
             if old_data is not None:
                 # Запускаем проверку в асинхронном режиме
                 if self.application:
-                    asyncio.create_task(self.check_shop_changes_async(old_data, new_data))
+                    asyncio.create_task(self.check_all_changes_async(old_data, new_data))
     
     def get_shop_inventory(self, data: dict, shop_type: str) -> Dict[str, int]:
         """Получает инвентарь магазина определенного типа"""
@@ -122,33 +125,55 @@ class ShopTrackerBot:
         inventory = self.get_shop_inventory(data, shop_type)
         return {item for item, stock in inventory.items() if stock > 0}
     
-    async def check_shop_changes_async(self, old_data: dict, new_data: dict):
-        """Асинхронная проверка изменений в магазинах"""
+    def get_weather(self, data: dict) -> Optional[str]:
+        """Получает текущую погоду"""
+        try:
+            weather = data.get('fullState', {}).get('child', {}).get('data', {}).get('weather')
+            return weather
+        except Exception as e:
+            logger.error(f"Error getting weather: {e}")
+            return None
+    
+    async def check_all_changes_async(self, old_data: dict, new_data: dict):
+        """Асинхронная проверка всех изменений"""
+        # Проверяем изменения в магазинах
         shop_types = ['seed', 'tool', 'egg', 'decor']
-        
         for shop_type in shop_types:
             old_available = self.get_available_items(old_data, shop_type)
             new_available = self.get_available_items(new_data, shop_type)
             
             # Находим новые товары
             new_items = new_available - old_available
+            # Находим товары, которые закончились
+            removed_items = old_available - new_available
             
             if new_items:
                 logger.info(f"New items in {shop_type} shop: {new_items}")
-                # Отправляем уведомления всем подписчикам
-                await self.notify_all_subscribers(shop_type, new_items)
+                await self.notify_all_subscribers(shop_type, new_items, is_new=True)
+            
+            if removed_items:
+                logger.info(f"Items removed in {shop_type} shop: {removed_items}")
+                await self.notify_all_subscribers(shop_type, removed_items, is_new=False)
+        
+        # Проверяем изменения погоды
+        old_weather = self.get_weather(old_data)
+        new_weather = self.get_weather(new_data)
+        
+        if old_weather != new_weather and new_weather is not None:
+            logger.info(f"Weather changed: {old_weather} -> {new_weather}")
+            await self.notify_weather_subscribers(old_weather, new_weather)
     
-    async def notify_all_subscribers(self, shop_type: str, new_items: Set[str]):
-        """Отправляет уведомления всем подписчикам"""
+    async def notify_all_subscribers(self, shop_type: str, items: Set[str], is_new: bool = True):
+        """Отправляет уведомления всем подписчикам о товарах"""
         if not self.application:
             logger.error("Application not set, cannot send notifications")
             return
             
         for user_id in list(self.user_subscriptions.keys()):
-            await self.send_notification_to_user(user_id, shop_type, new_items)
+            await self.send_shop_notification_to_user(user_id, shop_type, items, is_new)
     
-    async def send_notification_to_user(self, user_id: int, shop_type: str, new_items: Set[str]):
-        """Отправляет уведомление конкретному пользователю"""
+    async def send_shop_notification_to_user(self, user_id: int, shop_type: str, items: Set[str], is_new: bool = True):
+        """Отправляет уведомление конкретному пользователю о товарах"""
         if user_id not in self.user_subscriptions:
             return
         
@@ -158,19 +183,26 @@ class ShopTrackerBot:
         # Проверяем подписки
         if shop_type in subscriptions:
             if "*" in subscriptions[shop_type]:
-                # Подписан на все
-                items_to_notify = new_items
+                # Подписан на все товары в категории
+                items_to_notify = items
             else:
                 # Подписан на конкретные товары
-                items_to_notify = new_items.intersection(subscriptions[shop_type])
+                items_to_notify = items.intersection(subscriptions[shop_type])
         
         if items_to_notify:
-            message = f"🎉 **Новые товары в магазине!**\n\n"
+            if is_new:
+                status_emoji = "🎉"
+                status_text = "появились в наличии"
+            else:
+                status_emoji = "😢"
+                status_text = "закончились"
+            
+            message = f"{status_emoji} **Изменения в магазине!**\n\n"
             message += f"Категория: {self.get_category_name(shop_type)}\n"
-            message += f"Появились в наличии:\n"
+            message += f"Товары которые {status_text}:\n"
             for item in items_to_notify:
-                message += f"  ✅ {item}\n"
-            message += f"\nИспользуйте /shop, чтобы посмотреть магазин"
+                message += f"  {'✅' if is_new else '❌'} {item}\n"
+            message += f"\nИспользуйте /shop, чтобы посмотреть актуальный магазин"
             
             try:
                 await self.application.bot.send_message(
@@ -178,27 +210,48 @@ class ShopTrackerBot:
                     text=message, 
                     parse_mode='Markdown'
                 )
-                logger.info(f"Sent notification to user {user_id} about {items_to_notify}")
+                logger.info(f"Sent shop notification to user {user_id} about {items_to_notify}")
             except Exception as e:
                 logger.error(f"Failed to send notification to {user_id}: {e}")
+    
+    async def notify_weather_subscribers(self, old_weather: Optional[str], new_weather: str):
+        """Отправляет уведомления подписчикам на погоду"""
+        if not self.application:
+            logger.error("Application not set, cannot send notifications")
+            return
+        
+        
+        message = f"🌤️ **Погода изменилась!**\n\n"
+        
+        for user_id, subscriptions in self.user_subscriptions.items():
+            if 'weather' in subscriptions and ('*' in subscriptions['weather'] or 'weather' in subscriptions['weather']):
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"Sent weather notification to user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send weather notification to {user_id}: {e}")
     
     def get_category_name(self, category: str) -> str:
         """Получить русское название категории"""
         names = {
-            'seed': 'Семена',
-            'tool': 'Инструменты',
-            'egg': 'Яйца',
-            'decor': 'Декор'
+            'seed': '🌱 Семена',
+            'tool': '🛠️ Инструменты',
+            'egg': '🥚 Яйца',
+            'decor': '🏠 Декор',
+            'weather': '🌤️ Погода'
         }
         return names.get(category, category)
 
-# Инициализация трекера
+# Создаем глобальный экземпляр трекера
 shop_tracker = ShopTrackerBot()
 
-# Функция для обновления данных (может вызываться из другого потока)
-def update_game_data(data):
-    """Внешняя функция для обновления данных"""
-    shop_tracker.update_data(data)
+# Функция для внешнего обновления данных
+def update_game_data(new_data: dict):
+    shop_tracker.update_data(new_data)
 
 # Команды бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,14 +259,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
-        f"Я бот для отслеживания товаров в магазине.\n\n"
+        f"Я бот для отслеживания товаров в магазине и погоды.\n\n"
         f"Доступные команды:\n"
         f"/shop - просмотр текущих товаров\n"
-        f"/subscribe - подписаться на товары\n"
-        f"/unsubscribe - отписаться от товаров\n"
+        f"/weather - текущая погода\n"
+        f"/subscribe - подписаться на товары или погоду\n"
+        f"/unsubscribe - отписаться от товаров или погоды\n"
         f"/mysubscriptions - мои подписки\n"
         f"/help - помощь"
     )
+
+async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать текущую погоду"""
+    if shop_tracker.global_json_data is None:
+        await update.message.reply_text("Данные о погоде еще не загружены. Попробуйте позже.")
+        return
+    
+    current_weather = shop_tracker.get_weather(shop_tracker.global_json_data)
+    
+    if current_weather:
+        weather_emoji = {
+            'Sunny': '☀️',
+            'Rainy': '🌧️',
+            'Stormy': '⛈️',
+            'Snowy': '❄️',
+            'Cloudy': '☁️',
+            'Foggy': '🌫️'
+        }
+        emoji = weather_emoji.get(current_weather, '🌡️')
+        
+        weather_tips = {
+            'Sunny': '☀️ Отличная погода для роста растений!',
+            'Rainy': '🌧️ Дождь поливает растения естественным путем.',
+            'Stormy': '⛈️ Будьте осторожны, шторм может повредить урожай!',
+            'Snowy': '❄️ Снег замедляет рост растений.',
+            'Cloudy': '☁️ Пасмурно, но растениям комфортно.',
+            'Foggy': '🌫️ Туман создает загадочную атмосферу.'
+        }
+        tip = weather_tips.get(current_weather, '')
+        
+        message = f"**Текущая погода:** {emoji} {current_weather}\n\n{tip}"
+        
+        keyboard = [[
+            InlineKeyboardButton("🔔 Подписаться на погоду", callback_data="sub_weather")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("Информация о погоде недоступна.")
 
 async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать текущие товары в магазине"""
@@ -270,8 +364,11 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 
                 if available:
                     message += "\n".join(available) + "\n"
-                if unavailable:  # Показываем только если не слишком много
-                    message += "\n".join(unavailable) + "\n"
+                if unavailable and len(unavailable) <= 10:
+                    if unavailable:
+                        message += "\n".join(unavailable[:5]) + "\n"
+                if len(unavailable) > 10:
+                    message += f"  ... и {len(unavailable) - 5} других\n"
     else:
         shop_names = {
             'seed': '🌱 Семена',
@@ -304,14 +401,15 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
             message += "❌ Нет товаров в наличии\n\n"
         
         if unavailable:
-            message += "**Нет в наличии:**\n" + "\n".join(unavailable)
-            
+            message += "**Нет в наличии:**\n" + "\n".join(unavailable[:20])
+            if len(unavailable) > 20:
+                message += f"\n... и {len(unavailable) - 20} других"
         
-        # Добавляем кнопку для подписки
-        keyboard = [[
-            InlineKeyboardButton("🔔 Подписаться на эту категорию", 
-                               callback_data=f"sub_{category}")
-        ]]
+        # Добавляем кнопки для подписки на категорию или конкретные товары
+        keyboard = [
+            [InlineKeyboardButton("🔔 Подписаться на всю категорию", callback_data=f"sub_{category}")],
+            [InlineKeyboardButton("🔧 Подписаться на конкретные товары", callback_data=f"sub_specific_{category}")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
             message, 
@@ -323,19 +421,20 @@ async def show_shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(message, parse_mode='Markdown')
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подписка на товары"""
+    """Подписка на товары или погоду"""
     keyboard = [
         [InlineKeyboardButton("🌱 Семена", callback_data="sub_seed")],
         [InlineKeyboardButton("🛠️ Инструменты", callback_data="sub_tool")],
         [InlineKeyboardButton("🥚 Яйца", callback_data="sub_egg")],
         [InlineKeyboardButton("🏠 Декор", callback_data="sub_decor")],
+        [InlineKeyboardButton("🌤️ Погода", callback_data="sub_weather")],
         [InlineKeyboardButton("🔧 Выбрать конкретные товары", callback_data="sub_specific")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "Выберите категорию для подписки:\n"
-        "Вы будете получать уведомления, когда появятся новые товары в наличии",
+        "Вы будете получать уведомления об изменениях",
         reply_markup=reply_markup
     )
 
@@ -354,41 +453,77 @@ async def handle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
             await show_item_selection(query, context)
             return
         
-        # Подписка на всю категорию
+        if category == "weather":
+            # Подписка на погоду
+            shop_tracker.user_subscriptions[user_id]['weather'].add('weather')
+            await query.edit_message_text(
+                f"✅ Вы подписались на уведомления о погоде!\n"
+                f"Вы будете получать сообщения при изменении погоды."
+            )
+            return
+        
+        # Подписка на всю категорию товаров
         shop_tracker.user_subscriptions[user_id][category].add("*")
         
         await query.edit_message_text(
-            f"✅ Вы подписались на категорию '{get_category_name(category)}'!\n"
-            f"Вы будете получать уведомления о появлении новых товаров."
+            f"✅ Вы подписались на категорию '{shop_tracker.get_category_name(category)}'!\n"
+            f"Вы будете получать уведомления о появлении или исчезновении товаров."
         )
 
 async def show_item_selection(query, context: ContextTypes.DEFAULT_TYPE):
     """Показать выбор конкретных товаров для подписки"""
-    user_id = query.from_user.id
-    
     keyboard = []
     categories = ['seed', 'tool', 'egg', 'decor']
+    
+    # Кнопки для выбора категории сначала
     for category in categories:
-        if shop_tracker.global_json_data:
-            inventory = shop_tracker.get_shop_inventory(
-                shop_tracker.global_json_data, category
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📂 {shop_tracker.get_category_name(category)}",
+                callback_data=f"show_items_{category}"
             )
-            if inventory:
-                # Показываем только первые 10 товаров
-                items = list(inventory.keys())[:10]
-                for item in items:
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            f"{get_category_icon(category)} {item}",
-                            callback_data=f"sub_item_{category}_{item}"
-                        )
-                    ])
+        ])
     
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_subscribe")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
-        "Выберите конкретные товары для подписки:",
+        "Сначала выберите категорию, затем конкретные товары:",
+        reply_markup=reply_markup
+    )
+
+async def show_category_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать товары выбранной категории для подписки"""
+    query = update.callback_query
+    await query.answer()
+    
+    category = query.data.replace("show_items_", "")
+    
+    if not shop_tracker.global_json_data:
+        await query.edit_message_text("Данные еще не загружены.")
+        return
+    
+    inventory = shop_tracker.get_shop_inventory(shop_tracker.global_json_data, category)
+    
+    if not inventory:
+        await query.edit_message_text(f"Нет данных о товарах в категории {shop_tracker.get_category_name(category)}")
+        return
+    
+    keyboard = []
+    # Показываем все товары с возможностью подписки на каждый
+    for item in sorted(inventory.keys())[:30]:  # Ограничиваем 30 товарами
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🔔 {item}",
+                callback_data=f"sub_item_{category}_{item}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("◀️ Назад к выбору категории", callback_data="sub_specific")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"Выберите товары в категории {shop_tracker.get_category_name(category)} для подписки:",
         reply_markup=reply_markup
     )
 
@@ -403,15 +538,15 @@ async def subscribe_to_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shop_tracker.user_subscriptions[user_id][category].add(item)
     
     await query.edit_message_text(
-        f"✅ Вы подписались на товар '{item}' в категории '{get_category_name(category)}'!\n"
-        f"Вы получите уведомление, когда он появится в наличии."
+        f"✅ Вы подписались на товар '{item}' в категории '{shop_tracker.get_category_name(category)}'!\n"
+        f"Вы получите уведомление, когда он появится или исчезнет из магазина."
     )
 
 async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать текущие подписки пользователя"""
     user_id = update.effective_user.id
     
-    if user_id not in shop_tracker.user_subscriptions:
+    if user_id not in shop_tracker.user_subscriptions or not shop_tracker.user_subscriptions[user_id]:
         await update.message.reply_text("У вас нет активных подписок.")
         return
     
@@ -419,42 +554,59 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "📋 **Ваши подписки:**\n\n"
     
     for category, items in subscriptions.items():
-        category_name = get_category_name(category)
-        message += f"**{category_name}:**\n"
-        if "*" in items:
-            message += "  • Все товары\n"
+        category_name = shop_tracker.get_category_name(category)
+        if category == 'weather':
+            message += f"**{category_name}:**\n"
+            message += "  • Изменения погоды\n\n"
         else:
-            for item in items:
-                message += f"  • {item}\n"
-        message += "\n"
+            message += f"**{category_name}:**\n"
+            if "*" in items:
+                message += "  • Все товары в категории\n"
+            else:
+                for item in items:
+                    message += f"  • {item}\n"
+            message += "\n"
     
-    await update.message.reply_text(message, parse_mode='Markdown')
+    # Добавляем кнопку для быстрой отписки
+    keyboard = [[InlineKeyboardButton("❌ Отписаться", callback_data="unsub_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отписка от товаров"""
+    """Отписка от товаров или погоды"""
     user_id = update.effective_user.id
     
-    if user_id not in shop_tracker.user_subscriptions:
+    if user_id not in shop_tracker.user_subscriptions or not shop_tracker.user_subscriptions[user_id]:
         await update.message.reply_text("У вас нет активных подписок.")
         return
     
     keyboard = []
+    
     for category, items in shop_tracker.user_subscriptions[user_id].items():
-        if "*" in items:
+        if category == 'weather':
             keyboard.append([
                 InlineKeyboardButton(
-                    f"📛 Отписаться от {get_category_name(category)}",
-                    callback_data=f"unsub_category_{category}"
+                    f"📛 Отписаться от погоды",
+                    callback_data=f"unsub_weather"
                 )
             ])
         else:
-            for item in items:
+            if "*" in items:
                 keyboard.append([
                     InlineKeyboardButton(
-                        f"📛 {get_category_icon(category)} {item}",
-                        callback_data=f"unsub_item_{category}_{item}"
+                        f"📛 Отписаться от {shop_tracker.get_category_name(category)} (все)",
+                        callback_data=f"unsub_category_{category}"
                     )
                 ])
+            else:
+                for item in items:
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"📛 {get_category_icon(category)} {item}",
+                            callback_data=f"unsub_item_{category}_{item}"
+                        )
+                    ])
     
     keyboard.append([InlineKeyboardButton("🔴 Отписаться от всего", callback_data="unsub_all")])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_start")])
@@ -478,13 +630,19 @@ async def handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("✅ Вы отписались от всех уведомлений.")
         return
     
+    if action == "unsub_weather":
+        if 'weather' in shop_tracker.user_subscriptions[user_id]:
+            del shop_tracker.user_subscriptions[user_id]['weather']
+        await query.edit_message_text("✅ Вы отписались от уведомлений о погоде.")
+        return
+    
     parts = action.split("_")
     if len(parts) >= 3:
         if parts[1] == "category":
             category = parts[2]
             if category in shop_tracker.user_subscriptions[user_id]:
                 del shop_tracker.user_subscriptions[user_id][category]
-            await query.edit_message_text(f"✅ Вы отписались от категории '{get_category_name(category)}'.")
+            await query.edit_message_text(f"✅ Вы отписались от категории '{shop_tracker.get_category_name(category)}'.")
         elif parts[1] == "item":
             category = parts[2]
             item = "_".join(parts[3:])
@@ -500,14 +658,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 **Помощь по командам:**\n\n"
         "/start - Начать работу с ботом\n"
         "/shop - Просмотр товаров в магазине\n"
-        "/subscribe - Подписаться на товары\n"
-        "/unsubscribe - Отписаться от товаров\n"
+        "/weather - Текущая погода\n"
+        "/subscribe - Подписаться на товары или погоду\n"
+        "/unsubscribe - Отписаться от товаров или погоды\n"
         "/mysubscriptions - Мои подписки\n"
         "/help - Показать эту справку\n\n"
         "**Как это работает:**\n"
-        "1. Бот отслеживает изменения в магазине\n"
-        "2. Вы подписываетесь на нужные товары\n"
-        "3. Когда товар появляется в наличии - бот пришлет уведомление",
+        "1. Бот отслеживает изменения в магазине и погоде\n"
+        "2. Вы подписываетесь на нужные товары или погоду\n"
+        "3. Когда товар появляется/исчезает или меняется погода - бот пришлет уведомление",
         parse_mode='Markdown'
     )
 
@@ -518,6 +677,7 @@ async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("🛒 Показать магазин", callback_data="shop_main")],
+        [InlineKeyboardButton("🌤️ Погода", callback_data="weather_main")],
         [InlineKeyboardButton("🔔 Подписаться", callback_data="sub_main")],
         [InlineKeyboardButton("📋 Мои подписки", callback_data="my_subs")],
         [InlineKeyboardButton("❌ Отписаться", callback_data="unsub_main")]
@@ -530,15 +690,89 @@ async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-def get_category_name(category: str) -> str:
-    """Получить русское название категории"""
-    names = {
-        'seed': 'Семена',
-        'tool': 'Инструменты',
-        'egg': 'Яйца',
-        'decor': 'Декор'
-    }
-    return names.get(category, category)
+async def back_to_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к выбору категории для подписки"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🌱 Семена", callback_data="sub_seed")],
+        [InlineKeyboardButton("🛠️ Инструменты", callback_data="sub_tool")],
+        [InlineKeyboardButton("🥚 Яйца", callback_data="sub_egg")],
+        [InlineKeyboardButton("🏠 Декор", callback_data="sub_decor")],
+        [InlineKeyboardButton("🌤️ Погода", callback_data="sub_weather")],
+        [InlineKeyboardButton("🔧 Выбрать конкретные товары", callback_data="sub_specific")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "Выберите категорию для подписки:",
+        reply_markup=reply_markup
+    )
+
+async def my_subs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback для показа подписок"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if user_id not in shop_tracker.user_subscriptions or not shop_tracker.user_subscriptions[user_id]:
+        await query.edit_message_text("У вас нет активных подписок.")
+        return
+    
+    subscriptions = shop_tracker.user_subscriptions[user_id]
+    message = "📋 **Ваши подписки:**\n\n"
+    
+    for category, items in subscriptions.items():
+        category_name = shop_tracker.get_category_name(category)
+        if category == 'weather':
+            message += f"**{category_name}:**\n"
+            message += "  • Изменения погоды\n\n"
+        else:
+            message += f"**{category_name}:**\n"
+            if "*" in items:
+                message += "  • Все товары в категории\n"
+            else:
+                for item in items:
+                    message += f"  • {item}\n"
+            message += "\n"
+    
+    keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_start")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def weather_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback для показа погоды"""
+    query = update.callback_query
+    await query.answer()
+    
+    if shop_tracker.global_json_data is None:
+        await query.edit_message_text("Данные о погоде еще не загружены.")
+        return
+    
+    current_weather = shop_tracker.get_weather(shop_tracker.global_json_data)
+    
+    if current_weather:
+        weather_emoji = {
+            'Sunny': '☀️',
+            'Rainy': '🌧️',
+            'Stormy': '⛈️',
+            'Snowy': '❄️',
+            'Cloudy': '☁️',
+            'Foggy': '🌫️'
+        }
+        emoji = weather_emoji.get(current_weather, '🌡️')
+        
+        message = f"**Текущая погода:** {emoji} {current_weather}"
+        
+        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_start")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+    else:
+        await query.edit_message_text("Информация о погоде недоступна.")
 
 def get_category_icon(category: str) -> str:
     """Получить иконку категории"""
@@ -546,55 +780,23 @@ def get_category_icon(category: str) -> str:
         'seed': '🌱',
         'tool': '🛠️',
         'egg': '🥚',
-        'decor': '🏠'
+        'decor': '🏠',
+        'weather': '🌤️'
     }
     return icons.get(category, '📦')
-
-async def send_notifications(bot, user_id: int, shop_type: str, new_items: Set[str]):
-    """Отправить уведомления пользователю"""
-    if user_id not in shop_tracker.user_subscriptions:
-        return
-    
-    subscriptions = shop_tracker.user_subscriptions[user_id]
-    items_to_notify = set()
-    
-    # Проверяем подписки
-    if shop_type in subscriptions:
-        if "*" in subscriptions[shop_type]:
-            # Подписан на все
-            items_to_notify = new_items
-        else:
-            # Подписан на конкретные товары
-            items_to_notify = new_items.intersection(subscriptions[shop_type])
-    
-    if items_to_notify:
-        message = f"🎉 **Новые товары в магазине!**\n\n"
-        message += f"Категория: {get_category_name(shop_type)}\n"
-        message += f"Появились в наличии:\n"
-        for item in items_to_notify:
-            message += f"  ✅ {item}\n"
-        message += f"\nИспользуйте /shop, чтобы посмотреть магазин"
-        
-        try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-            logger.info(f"Sent notification to user {user_id} about {items_to_notify}")
-        except Exception as e:
-            logger.error(f"Failed to send notification to {user_id}: {e}")
-
-# Функция для периодической проверки (если данные обновляются не событийно)
-async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическая проверка изменений (если нужно)"""
-    # Здесь можно реализовать проверку, если данные обновляются не через update_data
-    pass
 
 def main():
     """Запуск бота"""
     # Создаем приложение
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
+    # Устанавливаем приложение в трекер
+    shop_tracker.set_application(application)
+    
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("shop", shop))
+    application.add_handler(CommandHandler("weather", weather))
     application.add_handler(CommandHandler("subscribe", subscribe))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe))
     application.add_handler(CommandHandler("mysubscriptions", my_subscriptions))
@@ -603,62 +805,36 @@ def main():
     # Регистрируем обработчики callback-запросов
     application.add_handler(CallbackQueryHandler(show_shop_category, pattern="^shop_"))
     application.add_handler(CallbackQueryHandler(handle_subscription, pattern="^sub_"))
+    application.add_handler(CallbackQueryHandler(show_category_items, pattern="^show_items_"))
     application.add_handler(CallbackQueryHandler(subscribe_to_item, pattern="^sub_item_"))
     application.add_handler(CallbackQueryHandler(handle_unsubscribe, pattern="^unsub_"))
-    application.add_handler(CallbackQueryHandler(back_to_start, pattern="^back_to_start"))
-    application.add_handler(CallbackQueryHandler(back_to_start, pattern="^shop_main"))
-    application.add_handler(CallbackQueryHandler(back_to_start, pattern="^sub_main"))
-    application.add_handler(CallbackQueryHandler(my_subscriptions, pattern="^my_subs"))
-    application.add_handler(CallbackQueryHandler(unsubscribe, pattern="^unsub_main"))
-    
-    # Запускаем периодическую проверку (опционально)
-    # job_queue = application.job_queue
-    # job_queue.run_repeating(periodic_check, interval=5, first=1)
+    application.add_handler(CallbackQueryHandler(back_to_start, pattern="^back_to_start$"))
+    application.add_handler(CallbackQueryHandler(back_to_start, pattern="^shop_main$"))
+    application.add_handler(CallbackQueryHandler(back_to_start, pattern="^sub_main$"))
+    application.add_handler(CallbackQueryHandler(my_subs_callback, pattern="^my_subs$"))
+    application.add_handler(CallbackQueryHandler(unsubscribe, pattern="^unsub_main$"))
+    application.add_handler(CallbackQueryHandler(back_to_subscribe, pattern="^back_to_subscribe$"))
+    application.add_handler(CallbackQueryHandler(weather_callback, pattern="^weather_main$"))
     
     # Запускаем бота
     print("Бот запущен...")
+    print("Доступные команды: /start, /shop, /weather, /subscribe, /unsubscribe, /mysubscriptions, /help")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# Функция для внешнего обновления данных с отправкой уведомлений
-async def update_data_and_notify(new_data: dict, bot):
-    """Обновляет данные и отправляет уведомления"""
-    old_data = shop_tracker.global_json_data
-    shop_tracker.global_json_data = new_data
-    
-    if old_data is not None:
-        shop_types = ['seed', 'tool', 'egg', 'decor']
-        for shop_type in shop_types:
-            old_available = shop_tracker.get_available_items(old_data, shop_type)
-            new_available = shop_tracker.get_available_items(new_data, shop_type)
-            new_items = new_available - old_available
-            
-            if new_items:
-                # Отправляем уведомления всем пользователям
-                for user_id in shop_tracker.user_subscriptions:
-                    await send_notifications(bot, user_id, shop_type, new_items)
-
 if __name__ == "__main__":
-    # Если нужно запустить с внешним циклом событий
-    # main()
-    
-    # Или с возможностью обновления данных из другого потока
     import threading
     
     def data_updater():
-        """Пример функции для имитации обновления данных"""
         import time
-        import random
         
         while True:
             new_data = asyncio.run(get_data())
             update_game_data(new_data)
-            shop_tracker.update_data(new_data)
             # Здесь должна быть ваша логика получения данных
             # Например, из WebSocket, API или другого источника
             time.sleep(5)  # Проверка каждые 10 секунд
             # new_data = get_data_from_source()
             # shop_tracker.update_data(new_data)
-            print("ABOBA")
     
     # Запускаем поток обновления данных
     updater_thread = threading.Thread(target=data_updater, daemon=True)
