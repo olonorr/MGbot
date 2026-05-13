@@ -9,6 +9,7 @@ from enum import Enum
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
+from telegram.error import TelegramError
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,6 +48,7 @@ class ShopNotifier:
         if user_id not in self.subscriptions:
             self.subscriptions[user_id] = set()
         self.subscriptions[user_id].add(Subscription(user_id, shop_type, item_id, item_name))
+        logger.info(f"Пользователь {user_id} подписался на {shop_type.value}: {item_id or 'все'}")
         
     def remove_subscription(self, user_id: int, shop_type: SubscriptionType, item_id: str = None):
         if user_id in self.subscriptions:
@@ -54,6 +56,7 @@ class ShopNotifier:
                         if s.shop_type == shop_type and (item_id is None or s.item_id == item_id)]
             for sub in to_remove:
                 self.subscriptions[user_id].discard(sub)
+                logger.info(f"Пользователь {user_id} отписался от {shop_type.value}: {item_id or 'все'}")
                 
     def get_user_subscriptions(self, user_id: int) -> List[Subscription]:
         return list(self.subscriptions.get(user_id, set()))
@@ -87,13 +90,14 @@ class ShopNotifier:
         for item in shop_data.get('inventory', []):
             item_id = item.get('species') or item.get('toolId') or item.get('eggId') or item.get('decorId')
             stock = item.get('initialStock', 0)
-            current_state[item_id] = stock
-            
-            # Проверяем, был ли товар в наличии раньше
-            old_state = self.last_shop_state.get(f"{shop_type.value}_{item_id}", 0)
-            if old_state == 0 and stock > 0:
-                # Товар появился в наличии
-                notifications.append((shop_type, item_id, stock))
+            if item_id:
+                current_state[item_id] = stock
+                
+                # Проверяем, был ли товар в наличии раньше
+                old_state = self.last_shop_state.get(f"{shop_type.value}_{item_id}", 0)
+                if old_state == 0 and stock > 0:
+                    # Товар появился в наличии
+                    notifications.append((shop_type, item_id, stock))
                 
         self.last_shop_state.update({f"{shop_type.value}_{k}": v for k, v in current_state.items()})
         
@@ -111,88 +115,126 @@ class ShopNotifier:
             SubscriptionType.DECOR: "🎨 Декор"
         }
         
-        item_display = ''.join([' ' + char if char.isupper() else char for char in item_id]).strip()
-        message = f"✨ {shop_names[shop_type]} ✨\n\nТовар появился в наличии!\n📦 {item_display}\n📊 В наличии: {stock} шт."
+        # Форматируем название товара
+        item_display = item_id.replace('_', ' ').strip()
         
+        message = (
+            f"✨ {shop_names[shop_type]} ✨\n\n"
+            f"Товар появился в наличии!\n"
+            f"📦 {item_display}\n"
+            f"📊 В наличии: {stock} шт.\n\n"
+            f"🔗 Ссылка: magicgarden.gg"
+        )
+        
+        notified_users = set()
         for user_id, subs in self.subscriptions.items():
             for sub in subs:
                 if sub.shop_type == shop_type and (sub.item_id is None or sub.item_id == item_id):
-                    try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=message,
-                            parse_mode='HTML'
-                        )
-                    except Exception as e:
-                        logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+                    if user_id not in notified_users:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=message,
+                                parse_mode='HTML'
+                            )
+                            notified_users.add(user_id)
+                            logger.info(f"Уведомление отправлено пользователю {user_id} о товаре {item_id}")
+                        except TelegramError as e:
+                            logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
     
     async def notify_weather_change(self, context: ContextTypes.DEFAULT_TYPE, weather_data):
         """Уведомляет о смене погоды"""
-        message = f"🌤️ <b>Погода изменилась!</b> 🌤️\n\n{json.dumps(weather_data, indent=2, ensure_ascii=False)}"
+        weather_text = self.format_weather(weather_data)
+        message = f"🌤️ <b>Погода изменилась!</b> 🌤️\n\n{weather_text}"
         
+        notified_users = set()
         for user_id, subs in self.subscriptions.items():
             for sub in subs:
                 if sub.shop_type == SubscriptionType.WEATHER:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=message,
-                            parse_mode='HTML'
-                        )
-                    except Exception as e:
-                        logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+                    if user_id not in notified_users:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=message,
+                                parse_mode='HTML'
+                            )
+                            notified_users.add(user_id)
+                            logger.info(f"Уведомление о погоде отправлено пользователю {user_id}")
+                        except TelegramError as e:
+                            logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+    
+    def format_weather(self, weather_data):
+        """Форматирует данные о погоде для отображения"""
+        if isinstance(weather_data, dict):
+            lines = []
+            for key, value in weather_data.items():
+                lines.append(f"• {key}: {value}")
+            return "\n".join(lines)
+        return str(weather_data)
 
 # Глобальный экземпляр уведомителя
 notifier = ShopNotifier()
-websocket_task = None
+websocket_connection = None
 latest_game_data = None
 
-async def listen_and_notify():
-    """Подключается к WebSocket и обрабатывает данные (запускается один раз)"""
-    versions_to_try = ["312", "313", "314", "315"]
+async def websocket_listener():
+    """Постоянный WebSocket слушатель"""
+    global latest_game_data, websocket_connection
     
-    for version in versions_to_try:
-        uri = f"wss://magicgarden.gg/version/{version}/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22{version}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
+    versions_to_try = ["312", "313", "314", "315", "316", "317"]
+    
+    while True:
+        for version in versions_to_try:
+            uri = f"wss://magicgarden.gg/version/{version}/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22{version}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
+            
+            try:
+                async with websockets.connect(uri, close_timeout=5, ping_interval=20, ping_timeout=60) as websocket:
+                    logger.info(f"✅ WebSocket подключен с версией {version}")
+                    print(f"✅ WebSocket подключен с версией {version}")
+                    websocket_connection = websocket
+                    
+                    while True:
+                        try:
+                            data = await asyncio.wait_for(websocket.recv(), timeout=30)
+                            json_data = json.loads(data)
+                            latest_game_data = json_data
+                            
+                            # Логируем полученные типы данных (для отладки)
+                            if 'type' in json_data:
+                                logger.debug(f"Получен тип данных: {json_data['type']}")
+                            
+                        except asyncio.TimeoutError:
+                            # Нормальное поведение - просто ждем дальше
+                            continue
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.warning("WebSocket соединение закрыто")
+                            break
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Ошибка парсинга JSON: {e}")
+                            continue
+                        except Exception as e:
+                            logger.error(f"Ошибка обработки WebSocket данных: {e}")
+                            continue
+                            
+            except Exception as e:
+                logger.error(f"Ошибка подключения с версией {version}: {e}")
+                continue
         
-        try:
-            async with websockets.connect(uri, close_timeout=3, ping_interval=20, ping_timeout=60) as websocket:
-                print(f"✅ Подключено с версией {version}")
-                logger.info(f"Подключено с версией {version}")
-                
-                while True:
-                    try:
-                        data = await asyncio.wait_for(websocket.recv(), timeout=30)
-                        json_data = json.loads(data)
-                        
-                        # Сохраняем последние данные
-                        global latest_game_data
-                        latest_game_data = json_data
-                        
-                    except asyncio.TimeoutError:
-                        print("⏳ Ожидание данных...")
-                        logger.info("Ожидание данных...")
-                        continue
-                    except websockets.exceptions.ConnectionClosed:
-                        print("🔌 Соединение закрыто, переподключение...")
-                        logger.warning("Соединение закрыто, переподключение...")
-                        break
-                    except json.JSONDecodeError as e:
-                        print(f"❌ Ошибка парсинга JSON: {e}")
-                        logger.error(f"Ошибка парсинга JSON: {e}")
-                        continue
-                    except Exception as e:
-                        print(f"❌ Ошибка обработки: {e}")
-                        logger.error(f"Ошибка обработки: {e}")
-                        continue
-                        
-        except Exception as e:
-            print(f"❌ Ошибка с версией {version}: {e}")
-            logger.error(f"Ошибка с версией {version}: {e}")
-            continue
+        # Если все версии не сработали, ждем перед повторной попыткой
+        logger.warning("Все версии WebSocket не сработали, переподключение через 30 секунд...")
+        await asyncio.sleep(30)
 
 async def game_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job для мониторинга игры"""
-    await listen_and_notify(context)
+    """Job для проверки обновлений"""
+    global latest_game_data
+    
+    if latest_game_data:
+        try:
+            await notifier.check_for_updates(context, latest_game_data)
+        except Exception as e:
+            logger.error(f"Ошибка при проверке обновлений: {e}")
+    else:
+        logger.debug("Ожидание данных от WebSocket...")
 
 # Команды бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -214,12 +256,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 При появлении товара или смене погоды я пришлю уведомление!
 """
-    await update.message.reply_text(welcome_text, parse_mode='HTML')
+    try:
+        await update.message.reply_text(welcome_text, parse_mode='HTML')
+    except TelegramError as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
 
 async def show_shop_items(update: Update, context: ContextTypes.DEFAULT_TYPE, shop_type: SubscriptionType, shop_name: str):
     """Показывает доступные товары в магазине для подписки"""
-    # Здесь нужно получить актуальный список товаров из последних данных
-    # Для демонстрации используем примерные данные
     items = {
         SubscriptionType.SEED: ["Carrot", "Cabbage", "Strawberry", "Aloe", "Beet", "Tomato", "Pumpkin"],
         SubscriptionType.TOOL: ["WateringCan", "PlanterPot", "CropCleanser", "Shovel"],
@@ -263,53 +306,74 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
     
-    if data == "back_to_menu":
-        await query.edit_message_text(
-            "Выберите действие:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌱 Семена", callback_data="menu_seed")],
-                [InlineKeyboardButton("🔧 Инструменты", callback_data="menu_tool")],
-                [InlineKeyboardButton("🥚 Яйца", callback_data="menu_egg")],
-                [InlineKeyboardButton("🎨 Декор", callback_data="menu_decor")],
-                [InlineKeyboardButton("🌤️ Погода", callback_data="menu_weather")],
-                [InlineKeyboardButton("📋 Мои подписки", callback_data="menu_my_subs")]
-            ])
-        )
-    elif data.startswith("sub_"):
-        parts = data.split("_")
-        shop_type_str = parts[1]
-        item_id = "_".join(parts[2:]) if len(parts) > 2 else None
+    try:
+        if data == "back_to_menu":
+            await query.edit_message_text(
+                "Выберите действие:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🌱 Семена", callback_data="menu_seed")],
+                    [InlineKeyboardButton("🔧 Инструменты", callback_data="menu_tool")],
+                    [InlineKeyboardButton("🥚 Яйца", callback_data="menu_egg")],
+                    [InlineKeyboardButton("🎨 Декор", callback_data="menu_decor")],
+                    [InlineKeyboardButton("🌤️ Погода", callback_data="menu_weather")],
+                    [InlineKeyboardButton("📋 Мои подписки", callback_data="menu_my_subs")]
+                ])
+            )
+        elif data.startswith("sub_"):
+            parts = data.split("_")
+            shop_type_str = parts[1]
+            item_id = "_".join(parts[2:]) if len(parts) > 2 else None
+            
+            shop_type = {
+                "seed": SubscriptionType.SEED,
+                "tool": SubscriptionType.TOOL,
+                "egg": SubscriptionType.EGG,
+                "decor": SubscriptionType.DECOR
+            }.get(shop_type_str)
+            
+            if shop_type:
+                if item_id == "all":
+                    notifier.add_subscription(user_id, shop_type)
+                    await query.edit_message_text(f"✅ Вы подписались на все товары в категории {shop_type_str}!")
+                else:
+                    notifier.add_subscription(user_id, shop_type, item_id)
+                    await query.edit_message_text(f"✅ Вы подписались на товар {item_id}!")
         
-        shop_type = {
-            "seed": SubscriptionType.SEED,
-            "tool": SubscriptionType.TOOL,
-            "egg": SubscriptionType.EGG,
-            "decor": SubscriptionType.DECOR
-        }.get(shop_type_str)
-        
-        if shop_type:
-            if item_id == "all":
-                notifier.add_subscription(user_id, shop_type)
-                await query.edit_message_text(f"✅ Вы подписались на все товары в категории {shop_type_str}!")
-            else:
-                notifier.add_subscription(user_id, shop_type, item_id)
-                await query.edit_message_text(f"✅ Вы подписались на товар {item_id}!")
-    
-    elif data.startswith("menu_"):
-        action = data[5:]
-        if action == "seed":
-            await show_shop_items_from_callback(query, SubscriptionType.SEED, "Семена")
-        elif action == "tool":
-            await show_shop_items_from_callback(query, SubscriptionType.TOOL, "Инструменты")
-        elif action == "egg":
-            await show_shop_items_from_callback(query, SubscriptionType.EGG, "Яйца")
-        elif action == "decor":
-            await show_shop_items_from_callback(query, SubscriptionType.DECOR, "Декор")
-        elif action == "weather":
-            notifier.add_subscription(user_id, SubscriptionType.WEATHER)
-            await query.edit_message_text("🌤️ Вы подписались на уведомления о погоде!")
-        elif action == "my_subs":
-            await show_user_subscriptions(query, user_id)
+        elif data.startswith("menu_"):
+            action = data[5:]
+            if action == "seed":
+                await show_shop_items_from_callback(query, SubscriptionType.SEED, "Семена")
+            elif action == "tool":
+                await show_shop_items_from_callback(query, SubscriptionType.TOOL, "Инструменты")
+            elif action == "egg":
+                await show_shop_items_from_callback(query, SubscriptionType.EGG, "Яйца")
+            elif action == "decor":
+                await show_shop_items_from_callback(query, SubscriptionType.DECOR, "Декор")
+            elif action == "weather":
+                notifier.add_subscription(user_id, SubscriptionType.WEATHER)
+                await query.edit_message_text("🌤️ Вы подписались на уведомления о погоде!")
+            elif action == "my_subs":
+                await show_user_subscriptions(query, user_id)
+        elif data.startswith("unsub_"):
+            parts = data.split("_")
+            shop_type_str = parts[1]
+            item_id = parts[2] if len(parts) > 2 and parts[2] != 'all' else None
+            
+            shop_type = {
+                "seed": SubscriptionType.SEED,
+                "tool": SubscriptionType.TOOL,
+                "egg": SubscriptionType.EGG,
+                "decor": SubscriptionType.DECOR,
+                "weather": SubscriptionType.WEATHER
+            }.get(shop_type_str)
+            
+            if shop_type:
+                notifier.remove_subscription(user_id, shop_type, item_id)
+                await query.edit_message_text(f"✅ Вы отписались от {shop_type_str}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка в handle_callback: {e}", exc_info=True)
+        await query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
 
 async def show_shop_items_from_callback(query, shop_type: SubscriptionType, shop_name: str):
     """Показывает товары из callback"""
@@ -361,10 +425,13 @@ async def unsubscribe_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for sub in subs:
         if sub.shop_type == SubscriptionType.WEATHER:
             name = "🌤️ Погода"
+            callback = f"unsub_weather_all"
         else:
             name = f"{sub.shop_type.value}: {sub.item_id if sub.item_id else 'все'}"
-        keyboard.append([InlineKeyboardButton(name, callback_data=f"unsub_{sub.shop_type.value}_{sub.item_id or 'all'}")])
+            callback = f"unsub_{sub.shop_type.value}_{sub.item_id if sub.item_id else 'all'}"
+        keyboard.append([InlineKeyboardButton(name, callback_data=callback)])
     
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Выберите подписку для отмены:", reply_markup=reply_markup)
 
@@ -386,30 +453,25 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode='HTML')
 
-async def game_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job для проверки обновлений в последних данных"""
-    global latest_game_data
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}", exc_info=True)
     
-    if latest_game_data:
-        # Проверяем обновления с последними полученными данными
-        await notifier.check_for_updates(context, latest_game_data)
-    else:
-        logger.info("Нет данных от WebSocket для проверки")
-
-async def start_websocket_listener():
-    """Запускает WebSocket слушатель в отдельной задаче"""
-    try:
-        await listen_and_notify()
-    except Exception as e:
-        logger.error(f"Ошибка в WebSocket слушателе: {e}")
-        # Попытка переподключения через 30 секунд
-        await asyncio.sleep(30)
-        asyncio.create_task(start_websocket_listener())
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Произошла ошибка. Пожалуйста, попробуйте позже."
+            )
+        except:
+            pass
 
 def main():
     """Запуск бота"""
     # Создание приложения
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Добавление обработчика ошибок
+    application.add_error_handler(error_handler)
     
     # Добавление обработчиков команд
     application.add_handler(CommandHandler("start", start))
@@ -422,13 +484,14 @@ def main():
     application.add_handler(CommandHandler("my_subscriptions", my_subscriptions))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Запускаем WebSocket слушатель как отдельную корутину
-    loop = asyncio.get_event_loop()
-    loop.create_task(start_websocket_listener())
+    # Запускаем WebSocket слушатель в отдельном потоке
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(websocket_listener())
     
-    # Добавление задачи мониторинга (каждые 10 секунд)
+    # Добавление задачи мониторинга (каждые 5 секунд)
     job_queue = application.job_queue
-    job_queue.run_repeating(game_monitor_job, interval=10, first=1)
+    job_queue.run_repeating(game_monitor_job, interval=5, first=1)
     
     # Запуск бота
     print("🤖 Бот запущен...")
