@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Замените на ваш токен
+TELEGRAM_BOT_TOKEN = "8538742738:AAF2QqkbRkMueE1fOg-n7Yb1EFRRnXOjPV4"  # Замените на ваш токен
 
 version = 310
 
