@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Токен вашего бота (замените на свой)
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8538742738:AAF2QqkbRkMueE1fOg-n7Yb1EFRRnXOjPV4"
 
 # Параметры подключения к WebSocket
 ROOM_ID = "7TWG"
