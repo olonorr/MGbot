@@ -147,9 +147,9 @@ notifier = ShopNotifier()
 
 async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
     """Подключается к WebSocket и обрабатывает данные"""
-    versions_to_try = ["312", "313", "314", "315"]
+    version = 310
     
-    for version in versions_to_try:
+    while True:
         uri = f"wss://magicgarden.gg/version/{version}/api/rooms/7TWG/connect?surface=%22web%22&platform=%22desktop%22&playerId=%22p_KWTb7ix7rFYy9yhS%22&version=%22{version}%22&anonymousUserStyle=%7B%22color%22%3A%22White%22%2C%22avatarBottom%22%3A%22Bottom_DefaultGray.png%22%2C%22avatarMid%22%3A%22Mid_DefaultGray.png%22%2C%22avatarTop%22%3A%22Top_DefaultGray.png%22%2C%22avatarExpression%22%3A%22Expression_Default.png%22%2C%22name%22%3A%22Sunny+Apple%22%7D&source=%22manualUrl%22&capabilities=%22fbo_mipmap_unsupported%22"
         
         try:
@@ -164,7 +164,10 @@ async def listen_and_notify(context: ContextTypes.DEFAULT_TYPE):
                         
                         # Проверяем обновления
                         await notifier.check_for_updates(context, json_data)
-                        
+                    
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        print(f"Версия {version} не подходит: {e}")
+                        version = version+1
                     except asyncio.TimeoutError:
                         print("Ожидание данных...")
                         logger.info("Ожидание данных...")
